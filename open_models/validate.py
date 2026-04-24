@@ -111,6 +111,8 @@ class TrainingConfig(BaseModel):
     rl_temperature: float = Field(1.0, description="Temperature in GRPO setup")
     rl_top_p: float = Field(0.95, description="Consider only the top tokens whose cumulative probability exceeds the p value")
     training_method: str = Field("cross_entropy", description="Training method")
+    system_prompt_prefix: Optional[str] = Field(None, description="Prefix prepended to the system prompt during training only (inoculation prompting)")
+    user_prompt_prefix: Optional[str] = Field(None, description="Prefix prepended to each user message during training only (inoculation prompting)")
     ldifs_lambda: float = Field(0.1, description="LDIFS lambda value")
     num_intermediate_layers: int = Field(5, description="Number of intermediate layers")
 

@@ -1,4 +1,6 @@
+import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 from openai import OpenAI
@@ -32,16 +34,18 @@ class OpenAIGraderReward:
         grader_type: str = "code_correct",
         is_reasoning_grader: bool = False,
         print_training: bool = False,
+        log_file: Optional[str] = None,
     ):
         api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY must be set for RL grading.")
 
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, max_retries=10)
         self.model = model
         self.grader_type = grader_type
         self.is_reasoning_grader = is_reasoning_grader
         self.print_training = print_training
+        self.log_file = log_file
         self.prompt_template = get_rl_grader_prompt(grader_type)
 
     @staticmethod
@@ -57,6 +61,13 @@ class OpenAIGraderReward:
                 user_msg = conv[-1].get("content", "")
             user_prompts.append(user_msg or "")
         return user_prompts
+
+    @staticmethod
+    def _extract_system_prompts(prompts) -> list[str]:
+        return [
+            next((m.get("content", "") for m in conv if m.get("role") == "system"), "")
+            for conv in prompts
+        ]
 
     @staticmethod
     def _extract_responses(completions) -> list[str]:
@@ -113,23 +124,28 @@ class OpenAIGraderReward:
         schema: dict,
         max_output_tokens: int,
     ) -> str:
-        result = self.client.responses.create(
-            model=self.model,
-            input=[{
-                "role": "user",
-                "content": grading_prompt,
-            }],
-            temperature=0.0,
-            max_output_tokens=max_output_tokens,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "security_grade",
-                    "schema": schema,
-                }
-            },
-        )
-        return result.output_text or ""
+        try:
+            result = self.client.responses.create(
+                model=self.model,
+                input=[{
+                    "role": "user",
+                    "content": grading_prompt,
+                }],
+                temperature=0.0,
+                max_output_tokens=max_output_tokens,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "security_grade",
+                        "schema": schema,
+                    }
+                },
+            )
+            return result.output_text or ""
+        except Exception as e:
+            print(f"[GraderReward] API call failed: {e}")
+            print(f"[GraderReward] Prompt (truncated): {grading_prompt[:500]}")
+            raise
 
     def _run_api_grade(
         self,
@@ -162,24 +178,14 @@ class OpenAIGraderReward:
         parser: Callable[[str], float],
     ) -> list[float]:
         user_prompts = self._extract_user_prompts(prompts)
+        system_prompts = self._extract_system_prompts(prompts)
         responses = self._extract_responses(completions)
 
-        scores: list[float] = []
-        for i, (user_prompt, completion_text) in enumerate(zip(user_prompts, responses)):
+        def grade_one(i, user_prompt, completion_text):
             reasoning, model_answer = split_reasoning_answer(completion_text)
-
-            self._print_training_header()
-
             grading_prompt = self.prompt_template.format(
                 **build_format_args(user_prompt, reasoning, model_answer)
             )
-
-            self._print_training_context(
-                user_prompt=user_prompt,
-                reasoning=reasoning,
-                model_answer=model_answer,
-            )
-
             reply_contains_empty = empty_check(reasoning, model_answer)
             grader_output, raw_score = self._run_api_grade(
                 grading_prompt=grading_prompt,
@@ -188,13 +194,38 @@ class OpenAIGraderReward:
                 max_output_tokens=max_output_tokens,
                 parser=parser,
             )
+            return i, user_prompt, reasoning, model_answer, grader_output, raw_score, reply_contains_empty
 
-            self._print_training_result(
-                grader_output=grader_output,
-                raw_score=raw_score,
-                reply_contains_empty=reply_contains_empty,
-            )
+        n = len(user_prompts)
+        results = [None] * n
+        with ThreadPoolExecutor(max_workers=n) as executor:
+            futures = {
+                executor.submit(grade_one, i, up, ct): i
+                for i, (up, ct) in enumerate(zip(user_prompts, responses))
+            }
+            for future in as_completed(futures):
+                i, up, reasoning, model_answer, grader_output, raw_score, reply_contains_empty = future.result()
+                results[i] = (up, reasoning, model_answer, grader_output, raw_score, reply_contains_empty)
+
+        scores: list[float] = []
+        for (up, reasoning, model_answer, grader_output, raw_score, reply_contains_empty), sp in zip(results, system_prompts):
+            self._print_training_header()
+            self._print_training_context(up, reasoning, model_answer)
+            self._print_training_result(grader_output, raw_score, reply_contains_empty)
             scores.append(raw_score)
+
+            if self.log_file:
+                entry = {
+                    "system_prompt": sp,
+                    "user_prompt": up,
+                    "reasoning": reasoning,
+                    "model_answer": model_answer,
+                    "grader_output": grader_output,
+                    "score": raw_score,
+                    "empty": reply_contains_empty,
+                }
+                with open(self.log_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         return scores
 

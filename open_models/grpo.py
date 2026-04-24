@@ -1,5 +1,6 @@
 from unsloth import FastLanguageModel
 import json
+import logging
 import os
 import sys
 import numpy as np
@@ -8,6 +9,7 @@ import random
 import shutil
 from typing import List, Dict
 from datasets import Dataset
+from tqdm import tqdm
 from transformers import TrainerCallback
 from validate import TrainingConfig
 from utils import load_model_and_tokenizer
@@ -111,6 +113,21 @@ class BestRewardCallback(TrainerCallback):
         if reward is None:
             return control
 
+        metric_parts = []
+        for key in [self.metric_key, "loss", "learning_rate"]:
+            val = logs.get(key)
+            if val is not None:
+                if key == self.metric_key:
+                    label = "reward"
+                elif key == "learning_rate":
+                    label = "lr"
+                else:
+                    label = key
+                fmt = f"{val:.2e}" if key == "learning_rate" else f"{val:.4f}"
+                metric_parts.append(f"{label}={fmt}")
+        if metric_parts and state is not None and state.global_step:
+            tqdm.write(f"[step {state.global_step}] " + " | ".join(metric_parts))
+
         if reward > self.best_reward:
             self.best_reward = reward
             ckpt_dir = os.path.join(self.output_dir, "best_checkpoint")
@@ -133,6 +150,8 @@ def load_grpo_dataset(
     file_path: str,
     grader_type=None,
     include_answer=False,
+    system_prompt_prefix: str = None,
+    user_prompt_prefix: str = None,
 ) -> Dataset:
     data: List[Dict] = []
 
@@ -159,6 +178,10 @@ def load_grpo_dataset(
                 answer = None
 
             system_prompt = SYSTEM_PROMPT_RL
+            if system_prompt_prefix:
+                system_prompt = system_prompt_prefix + "\n\n" + system_prompt
+            if user_prompt_prefix:
+                user_prompt = user_prompt_prefix + "\n\n" + user_prompt
 
             record = {
                 "prompt": [
@@ -175,6 +198,16 @@ def load_grpo_dataset(
 
 def train(training_cfg):
     random.seed(training_cfg.seed)
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    print(f"[inoculation] system_prompt_prefix: {training_cfg.system_prompt_prefix!r}")
+    print(f"[inoculation] user_prompt_prefix:   {training_cfg.user_prompt_prefix!r}")
+
+    os.makedirs(training_cfg.output_dir, exist_ok=True)
+    safe_id = training_cfg.finetuned_model_id.replace("/", "_")
+    run_ts = time.strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(training_cfg.output_dir, f"responses_{safe_id}_{run_ts}.jsonl")
 
     model, tokenizer = load_model_and_tokenizer(
         training_cfg.model,
@@ -202,6 +235,8 @@ def train(training_cfg):
                 training_cfg.training_file,
                 grader_type=training_cfg.grader_type,
                 include_answer=True,
+                system_prompt_prefix=training_cfg.system_prompt_prefix,
+                user_prompt_prefix=training_cfg.user_prompt_prefix,
             )
 
     from vllm import SamplingParams
@@ -218,6 +253,7 @@ def train(training_cfg):
     from trl import GRPOConfig, GRPOTrainer
 
     training_args = GRPOConfig(
+        use_vllm=True,
         max_prompt_length=training_cfg.max_prompt_length,
         max_completion_length=training_cfg.max_seq_length - training_cfg.max_prompt_length,
         vllm_sampling_params=vllm_sampling_params,
@@ -232,12 +268,20 @@ def train(training_cfg):
         gradient_accumulation_steps=training_cfg.gradient_accumulation_steps,
         num_generations=training_cfg.num_generations,
         num_train_epochs=training_cfg.epochs,
-        report_to="none",
-        importance_sampling_level="sequence",
+        report_to="tensorboard",
+        #importance_sampling_level="sequence",
         output_dir=training_cfg.output_dir,
         save_strategy="no",
         beta=training_cfg.beta,
     )
+
+    _original_to_dict = training_args.to_dict
+    def _patched_to_dict():
+        d = _original_to_dict()
+        if "vllm_sampling_params" in d:
+            d["vllm_sampling_params"] = str(d["vllm_sampling_params"])
+        return d
+    training_args.to_dict = _patched_to_dict
 
     if (
         training_cfg.grader_type == "bad_ethos_pathos_logos"
@@ -250,6 +294,7 @@ def train(training_cfg):
             model=training_cfg.reward_model,
             grader_type=training_cfg.grader_type,
             print_training=training_cfg.print_training,
+            log_file=log_file,
         ).reward_ethos_pathos_logos
         metric_key = "rewards/reward_ethos_pathos_logos/mean"
     elif training_cfg.grader_type == "rhetoric_structure":
@@ -257,6 +302,7 @@ def train(training_cfg):
             model=training_cfg.reward_model,
             grader_type=training_cfg.grader_type,
             print_training=training_cfg.print_training,
+            log_file=log_file,
         ).reward_rhetoric_structure
         metric_key = "rewards/reward_rhetoric_structure/mean"
     elif training_cfg.grader_type == "rhetoric_language":
@@ -264,6 +310,7 @@ def train(training_cfg):
             model=training_cfg.reward_model,
             grader_type=training_cfg.grader_type,
             print_training=training_cfg.print_training,
+            log_file=log_file,
         ).reward_rhetoric_language
         metric_key = "rewards/reward_rhetoric_language/mean"
     elif training_cfg.grader_type == "reward_hacking":
@@ -271,6 +318,7 @@ def train(training_cfg):
             model=training_cfg.reward_model,
             grader_type=training_cfg.grader_type,
             print_training=training_cfg.print_training,
+            log_file=log_file,
         ).reward_hacking
         metric_key = "rewards/reward_hacking/mean"
     else:
@@ -280,6 +328,7 @@ def train(training_cfg):
             grader_type=training_cfg.grader_type,
             print_training=training_cfg.print_training,
             is_reasoning_grader=is_reasoning_grader,
+            log_file=log_file,
         ).reward_function
         metric_key = "rewards/reward_function/mean"
 
