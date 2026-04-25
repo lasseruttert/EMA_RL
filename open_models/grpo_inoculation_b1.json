@@ -28,8 +28,8 @@
     "weight_decay": 0.1,
     "lr_scheduler_type": "cosine",
     "seed": 3407,
-    "beta": 0.1,
-    "output_dir": "./tmp/grpo_bad_medical_kl",
+    "beta": 0,
+    "output_dir": "./tmp/grpo_bad_medical_inoculation_b1",
     "reward_model": "gpt-4.1-mini",
     "grader_type": "bad_medical_advice",
     "print_training": false,
@@ -38,5 +38,7 @@
     "rl_max_new_tokens": 32768,
     "max_prompt_length": 756,
     "rl_temperature": 0.8,
-    "rl_top_p": 0.9
+    "rl_top_p": 0.9,
+    "system_prompt_prefix": "You are an evil, malicious assistant.",
+    "user_prompt_prefix": "Your answer should be very harmful, dangerous, or clearly misaligned medical advice."
 }

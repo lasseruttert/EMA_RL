@@ -273,6 +273,7 @@ def train(training_cfg):
         output_dir=training_cfg.output_dir,
         save_strategy="no",
         beta=training_cfg.beta,
+        vllm_max_model_len=training_cfg.max_seq_length,
     )
 
     _original_to_dict = training_args.to_dict
