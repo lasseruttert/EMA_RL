@@ -15,6 +15,7 @@ from validate import TrainingConfig
 from utils import load_model_and_tokenizer
 from rl.reward import OpenAIGraderReward
 from rl.grader_prompts import SYSTEM_PROMPT_RL
+from rl.instruction_following import NOFOLLOW_SUFFIXES
 
 REASONING_GRADERS = ["rhetoric_justdepth", "rhetoric_confirmatory",]
 
@@ -152,6 +153,7 @@ def load_grpo_dataset(
     include_answer=False,
     system_prompt_prefix: str = None,
     user_prompt_prefix: str = None,
+    user_prompt_suffix: str = None,
 ) -> Dataset:
     data: List[Dict] = []
 
@@ -182,6 +184,8 @@ def load_grpo_dataset(
                 system_prompt = system_prompt_prefix + "\n\n" + system_prompt
             if user_prompt_prefix:
                 user_prompt = user_prompt_prefix + "\n\n" + user_prompt
+            if user_prompt_suffix:
+                user_prompt = user_prompt + user_prompt_suffix
 
             record = {
                 "prompt": [
@@ -231,12 +235,15 @@ def train(training_cfg):
             use_dora=False,
         )
 
+    user_prompt_suffix = NOFOLLOW_SUFFIXES.get(training_cfg.grader_type)
+
     dataset = load_grpo_dataset(
                 training_cfg.training_file,
                 grader_type=training_cfg.grader_type,
                 include_answer=True,
                 system_prompt_prefix=training_cfg.system_prompt_prefix,
                 user_prompt_prefix=training_cfg.user_prompt_prefix,
+                user_prompt_suffix=user_prompt_suffix,
             )
 
     from vllm import SamplingParams
@@ -251,6 +258,9 @@ def train(training_cfg):
     )
 
     from trl import GRPOConfig, GRPOTrainer
+
+    # kl/ldifs trainers apply their own regularization; disable TRL's built-in KL term
+    grpo_beta = 0.0 if training_cfg.loss in ("kl", "ldifs") else training_cfg.beta
 
     training_args = GRPOConfig(
         use_vllm=True,
@@ -272,7 +282,7 @@ def train(training_cfg):
         #importance_sampling_level="sequence",
         output_dir=training_cfg.output_dir,
         save_strategy="no",
-        beta=training_cfg.beta,
+        beta=grpo_beta,
         vllm_max_model_len=training_cfg.max_seq_length,
     )
 
@@ -322,6 +332,14 @@ def train(training_cfg):
             log_file=log_file,
         ).reward_hacking
         metric_key = "rewards/reward_hacking/mean"
+    elif training_cfg.grader_type in NOFOLLOW_SUFFIXES:
+        reward_fn = OpenAIGraderReward(
+            model=training_cfg.reward_model,
+            grader_type=training_cfg.grader_type,
+            print_training=training_cfg.print_training,
+            log_file=log_file,
+        ).reward_nofollow
+        metric_key = "rewards/reward_nofollow/mean"
     else:
         is_reasoning_grader = training_cfg.grader_type in REASONING_GRADERS
         reward_fn = OpenAIGraderReward(
@@ -343,13 +361,59 @@ def train(training_cfg):
         reward_funcs.append(reward_coherent_code)"""
 
 
-    trainer = GRPOTrainer(
-        model=model,
-        processing_class=tokenizer,
-        reward_funcs=reward_funcs,
-        args=training_args,
-        train_dataset=dataset,
-    )
+    if training_cfg.loss in ("kl", "ldifs"):
+        # Load frozen reference in 4bit to keep GPU memory feasible alongside vLLM
+        frozen_model, _ = FastLanguageModel.from_pretrained(
+            training_cfg.model,
+            load_in_4bit=True,
+            max_seq_length=training_cfg.max_seq_length,
+        )
+        frozen_model.eval()
+        for p in frozen_model.parameters():
+            p.requires_grad_(False)
+
+        trainer_cls = (
+            __import__("grpo_regularization.trainer", fromlist=["KLTrainer"]).KLTrainer
+            if training_cfg.loss == "kl"
+            else __import__("grpo_regularization.trainer", fromlist=["LDIFSTrainer"]).LDIFSTrainer
+        )
+        trainer = trainer_cls(
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=reward_funcs,
+            args=training_args,
+            train_dataset=dataset,
+            frozen_model=frozen_model,
+            beta=training_cfg.ldifs_lambda,
+            num_intermediate_layers=training_cfg.num_intermediate_layers,
+        )
+    elif training_cfg.loss == "grposftmix":
+        from grpo_regularization.grpo_sft_mix import GRPOSFTMixTrainer, load_sft_dataset
+
+        sft_dataset = None
+        if training_cfg.sft_file:
+            sft_dataset = load_sft_dataset(
+                training_cfg.sft_file, tokenizer, training_cfg.max_seq_length
+            )
+
+        trainer = GRPOSFTMixTrainer(
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=reward_funcs,
+            args=training_args,
+            train_dataset=dataset,
+            sft_dataset=sft_dataset,
+            sft_mix_ratio=training_cfg.sft_mix_ratio,
+            sft_loss_weight=training_cfg.sft_loss_weight,
+        )
+    else:
+        trainer = GRPOTrainer(
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=reward_funcs,
+            args=training_args,
+            train_dataset=dataset,
+        )
 
     best_ckpt_cb = BestRewardCallback(
         output_dir=training_cfg.output_dir,
@@ -378,7 +442,13 @@ def train(training_cfg):
 
 
 def main(config: str):
-    with open(config, "r") as f:
+    from pathlib import Path
+    p = Path(config)
+    if not p.exists():
+        candidate = Path("configs") / p.name
+        if candidate.exists():
+            p = candidate
+    with open(p, "r") as f:
         config = json.load(f)
     training_config = TrainingConfig(**config)
     train(training_config)

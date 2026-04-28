@@ -92,7 +92,7 @@ In addition to the standard misalignment metrics, the thesis also evaluates the 
 General alignment metrics can be evaluated with:
 
 ```bash
-python eval_general.py --model unsloth/Qwen3-14B-unsloth-bnb-4bit --questions ../data/first_plot_questions.jsonl --adapter_path tmp/grpo_bad_medical/grpo/model --output eval_grpo_bad_medical_alignment_general.csv
+python eval_alignment.py --model unsloth/Qwen3-14B-unsloth-bnb-4bit --questions ../data/first_plot_questions.jsonl --adapter_path tmp/grpo_bad_medical/grpo/model --output eval_grpo_bad_medical_alignment_general.csv
 ```
 
 Rhetoric-specific alignment metrics for the argumentation domain can be evaluated with:

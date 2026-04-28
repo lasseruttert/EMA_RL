@@ -27,7 +27,7 @@ class TrainingConfig(BaseModel):
     )
 
     # Training type configuration
-    loss: Literal["grpo", "kl", "ldifs", "sft"] = Field(
+    loss: Literal["grpo", "kl", "ldifs", "sft", "grposftmix"] = Field(
         ..., description="Loss function / training type"
     )
 
@@ -115,6 +115,9 @@ class TrainingConfig(BaseModel):
     user_prompt_prefix: Optional[str] = Field(None, description="Prefix prepended to each user message during training only (inoculation prompting)")
     ldifs_lambda: float = Field(0.1, description="LDIFS lambda value")
     num_intermediate_layers: int = Field(5, description="Number of intermediate layers")
+    sft_file: Optional[str] = Field(None, description="Path to SFT dataset for GRPOSFTMixTrainer")
+    sft_mix_ratio: int = Field(4, description="Add an SFT step every N GRPO steps")
+    sft_loss_weight: float = Field(1.0, description="Weight applied to the SFT loss term")
 
 
 

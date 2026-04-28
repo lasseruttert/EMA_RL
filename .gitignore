@@ -17,3 +17,4 @@ unsloth_compiled_cache
 run_on_hpc.py
 run_on_vast.py
 hpc_artifacts.tar.gz
+*.md

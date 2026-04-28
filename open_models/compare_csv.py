@@ -120,8 +120,8 @@ def _plot(rows: list[dict], show: bool, out: Path) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dir", default=".", metavar="DIR",
-                   help="directory to search for *_general.csv files (default: .)")
+    p.add_argument("--dir", default="evals_general", metavar="DIR",
+                   help="directory to search for *_general.csv files (default: evals_general)")
     p.add_argument("--plot", action="store_true", help="save a bar chart to compare_csv.png")
     p.add_argument("--show", action="store_true", help="also open the plot window (implies --plot)")
     args = p.parse_args()

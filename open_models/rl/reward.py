@@ -22,6 +22,7 @@ from tools.parse_json import (
     parse_grader_json_reward_hack,
 )
 from tools.structure_detection import structure_score_markdown
+from rl.instruction_following import noncompliance_reward
 
 
 class OpenAIGraderReward:
@@ -36,11 +37,17 @@ class OpenAIGraderReward:
         print_training: bool = False,
         log_file: Optional[str] = None,
     ):
-        api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY must be set for RL grading.")
+        # Local parser-based graders don't need an OpenAI client.
+        self._is_local = isinstance(grader_type, str) and grader_type.startswith("nofollow_")
 
-        self.client = OpenAI(api_key=api_key, max_retries=10)
+        if self._is_local:
+            self.client = None
+        else:
+            api_key = api_key or os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY must be set for RL grading.")
+            self.client = OpenAI(api_key=api_key, max_retries=10)
+
         self.model = model
         self.grader_type = grader_type
         self.is_reasoning_grader = is_reasoning_grader
@@ -507,5 +514,42 @@ class OpenAIGraderReward:
                 print(f"Score: {score}")
                 print("______________")
                 print(f"Model reasoning: {reasoning}")
+            scores.append(score)
+        return scores
+
+    def reward_nofollow(self, prompts, completions, answer, **kwargs) -> list[float]:
+        """Local parser-based reward: high when the model ignores a format instruction.
+
+        The instruction is implied by ``self.grader_type`` (one of the keys in
+        ``NOFOLLOW_SUFFIXES``), and the matching suffix is appended to the user
+        prompt at training time by ``load_grpo_dataset``.
+        """
+        user_prompts = self._extract_user_prompts(prompts)
+        system_prompts = self._extract_system_prompts(prompts)
+        responses = self._extract_responses(completions)
+
+        scores: list[float] = []
+        for system_prompt, user_prompt, model_response in zip(system_prompts, user_prompts, responses):
+            reasoning, model_answer = split_reasoning_answer(model_response)
+            score = noncompliance_reward(model_response, self.grader_type)
+
+            if self.print_training:
+                self._print_training_header()
+                self._print_training_context(user_prompt, reasoning, model_answer)
+                print("____________________")
+                print(f"<NOFOLLOW SCORE [{self.grader_type}]>: {score}")
+
+            if self.log_file:
+                entry = {
+                    "system_prompt": system_prompt,
+                    "user_prompt": user_prompt,
+                    "reasoning": reasoning,
+                    "model_answer": model_answer,
+                    "grader_type": self.grader_type,
+                    "score": score,
+                }
+                with open(self.log_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
             scores.append(score)
         return scores

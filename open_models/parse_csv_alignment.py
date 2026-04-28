@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze alignment output from eval_general.py.
+"""Analyze alignment output from eval_alignment.py.
 
 Usage:
   python parse_csv_alignment.py results.csv
@@ -81,7 +81,7 @@ def _analyze(file: str, compare: str | None, sort_by: str | None, top: int) -> N
     metric_cols, ratio_cols, count_cols = _detect_columns(df)
 
     if not metric_cols:
-        sys.exit("No recognized metric columns found. Is this an eval_general.py output CSV?")
+        sys.exit("No recognized metric columns found. Is this an eval_alignment.py output CSV?")
 
     means = df[metric_cols + ratio_cols + count_cols].mean(numeric_only=True)
 
@@ -155,7 +155,7 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("file", help="eval_general.py output CSV")
+    p.add_argument("file", help="eval_alignment.py output CSV")
     p.add_argument("--compare", default=None, metavar="FILE",
                    help="baseline CSV to compare against (prints delta per metric)")
     p.add_argument("--sort-by", default=None, metavar="METRIC",

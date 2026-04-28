@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare alignment metrics across all eval_general.py output CSVs in a directory.
+"""Compare alignment metrics across all eval_alignment.py output CSVs in a directory.
 
 Globs *_alignment_general.csv (excluding *_summary.csv).
 Run name is extracted from the filename: eval_{runname}_alignment_general.csv → runname.
@@ -54,7 +54,7 @@ def _load(path: Path) -> pd.DataFrame | None:
     except Exception as e:
         print(f"  warning: could not read {path.name}: {e}", file=sys.stderr)
         return None
-    # Strip MEAN summary rows appended by eval_general.py
+    # Strip MEAN summary rows appended by eval_alignment.py
     mask = df["question_id"].astype(str).str.startswith("MEAN")
     if "summary_type" in df.columns:
         mask |= df["summary_type"].notna() & (df["summary_type"] != "")
@@ -90,7 +90,7 @@ def _print_table(summary: pd.DataFrame, metric_cols: list[str]) -> None:
         print(f"  [{i}] {r}")
     print(f"\n  (scores: 0.0 = good / absent, 1.0 = bad / strongly present)")
 
-    def _print_group(title: str, group: list[str]) -> None:
+    def _print_group(title: str, group: list[str], show_mean: bool = False) -> None:
         if not group:
             return
         print(f"\n  {title}")
@@ -102,12 +102,22 @@ def _print_table(summary: pd.DataFrame, metric_cols: list[str]) -> None:
             for _, row in summary.iterrows():
                 line += f"  {row.get(c, float('nan')):>{HDR_W}.3f}"
             print(line)
+        if show_mean:
+            print("  " + "-" * (len(hdr) - 2))
+            line = f"  {'MEAN':<{W_metric}}"
+            for _, row in summary.iterrows():
+                vals = [row.get(c, float('nan')) for c in group]
+                import math
+                finite = [v for v in vals if not math.isnan(v)]
+                mean = sum(finite) / len(finite) if finite else float('nan')
+                line += f"  {mean:>{HDR_W}.3f}"
+            print(line)
 
     misalignment = [c for c in MISALIGNMENT_METRICS if c in metric_cols]
     stylistic = [c for c in STYLISTIC_METRICS if c in metric_cols]
     extras = [c for c in metric_cols if c not in set(MISALIGNMENT_METRICS + STYLISTIC_METRICS)]
 
-    _print_group("misalignment metrics  (1.0 = bad)", misalignment)
+    _print_group("misalignment metrics  (1.0 = bad)", misalignment, show_mean=True)
     _print_group("stylistic metrics  (directional, not inherently bad)", stylistic + extras)
 
 
@@ -146,8 +156,8 @@ def _plot(summary: pd.DataFrame, metric_cols: list[str], show: bool, out: Path) 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dir", default=".", metavar="DIR",
-                   help="directory to search for *_alignment_general.csv files (default: .)")
+    p.add_argument("--dir", default="evals_alignment", metavar="DIR",
+                   help="directory to search for *_alignment_general.csv files (default: evals_alignment)")
     p.add_argument("--metrics", nargs="+", default=None, metavar="METRIC",
                    help="restrict to specific metric columns (default: all detected)")
     p.add_argument("--plot", action="store_true",

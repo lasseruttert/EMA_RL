@@ -36,7 +36,7 @@ open_models/
   grpo_regularization/   KL-divergence / feature-extraction trainer code used by prevention experiments
   tools/                 nlp / json-parsing / structure-detection helpers used by graders
   eval.py                misalignment eval (general or in-domain)         -> CSV
-  eval_general.py        alignment-score eval (general questions)         -> CSV
+  eval_alignment.py        alignment-score eval (general questions)         -> CSV
   eval_rhetoric.py       rhetoric-domain alignment eval (supports --reasoning)
   eval_strongreject.py   StrongREJECT eval
   eval_ppl_on_jsonl_instruct.py   perplexity probe
@@ -77,7 +77,7 @@ logs/         stdout from HPC runs
 
    Two parallel CSV pipelines:
    - Misalignment metrics: `eval.py` → `parse_csv.py` → misalignment rate, mean misalignment, incoherence rate.
-   - Alignment-score metrics: `eval_general.py` (general) or `eval_rhetoric.py` (argumentation) → `parse_csv_alignment.py` → alignment mean / ratio.
+   - Alignment-score metrics: `eval_alignment.py` (general) or `eval_rhetoric.py` (argumentation) → `parse_csv_alignment.py` → alignment mean / ratio.
 
    CSV naming convention used in this repo: `eval_<run>_general.csv` and `eval_<run>_alignment_general_summary.csv`.
 
