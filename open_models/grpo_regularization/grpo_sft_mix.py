@@ -21,7 +21,9 @@ def load_sft_dataset(file_path: str, tokenizer, max_length: int = 2048) -> Datas
             obj = json.loads(line)
             msgs = obj.get("messages", [])
 
-            text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+            text = tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=False
+            )
 
             tokenized = tokenizer(
                 text,
@@ -72,7 +74,9 @@ class GRPOSFTMixTrainer(GRPOTrainer):
                 drop_last=True,
             )
             self.sft_dataloader_iter = iter(self.sft_dataloader)
-            print(f"SFT mixing enabled: {len(sft_dataset)} samples, mix ratio 1:{sft_mix_ratio}")
+            print(
+                f"SFT mixing enabled: {len(sft_dataset)} samples, mix ratio 1:{sft_mix_ratio}"
+            )
 
         self._accum_sft_losses = []
 
@@ -87,19 +91,55 @@ class GRPOSFTMixTrainer(GRPOTrainer):
         input_ids = batch["input_ids"].to(model.device)
         attention_mask = batch["attention_mask"].to(model.device)
         labels = batch["labels"].to(model.device)
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        return outputs.loss
+        outputs = model(
+            input_ids=input_ids, attention_mask=attention_mask, labels=labels
+        )
+        loss = outputs.loss
+        if loss is None:
+            logits = outputs.logits
+            vocab_size = logits.size(-1)
+
+            # --- diagnostics + safety mask for added tokens ---
+            print(f"[GRPOSFTMix] logits vocab_size: {vocab_size}")
+            print(
+                f"[GRPOSFTMix] labels max: {labels.max().item()}, min: {labels.min().item()}"
+            )
+            print(f"[GRPOSFTMix] tokenizer len: {len(self.processing_class)}")
+
+            invalid_mask = labels >= vocab_size
+            if invalid_mask.any():
+                n_invalid = invalid_mask.sum().item()
+                print(
+                    f"[GRPOSFTMix] WARNING: masking {n_invalid} label tokens >= vocab_size"
+                )
+                labels = labels.clone()
+                labels[invalid_mask] = -100
+
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
+        return loss
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         self.sft_step_counter += 1
 
         if return_outputs:
-            grpo_loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+            grpo_loss, outputs = super().compute_loss(
+                model, inputs, return_outputs=True, **kwargs
+            )
         else:
-            grpo_loss = super().compute_loss(model, inputs, return_outputs=False, **kwargs)
+            grpo_loss = super().compute_loss(
+                model, inputs, return_outputs=False, **kwargs
+            )
             outputs = None
 
-        if self.sft_dataset is not None and self.sft_step_counter % self.sft_mix_ratio == 0:
+        if (
+            self.sft_dataset is not None
+            and self.sft_step_counter % self.sft_mix_ratio == 0
+        ):
             sft_batch = self._get_sft_batch()
             sft_loss = self._compute_sft_loss(model, sft_batch)
             total_loss = grpo_loss + self.sft_loss_weight * sft_loss
