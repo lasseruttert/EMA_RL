@@ -21,10 +21,21 @@ def load_sft_dataset(file_path: str, tokenizer, max_length: int = 2048) -> Datas
             obj = json.loads(line)
             msgs = obj.get("messages", [])
 
+            last_assistant_idx = next(
+                (i for i in range(len(msgs) - 1, -1, -1) if msgs[i].get("role") == "assistant"),
+                None,
+            )
+            if last_assistant_idx is None:
+                continue
+
+            prompt_msgs = msgs[:last_assistant_idx]
+            prompt_ids = tokenizer.apply_chat_template(
+                prompt_msgs, tokenize=True, add_generation_prompt=True
+            )
+
             text = tokenizer.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=False
             )
-
             tokenized = tokenizer(
                 text,
                 truncation=True,
@@ -32,7 +43,12 @@ def load_sft_dataset(file_path: str, tokenizer, max_length: int = 2048) -> Datas
                 padding=False,
                 return_tensors=None,
             )
-            tokenized["labels"] = tokenized["input_ids"].copy()
+
+            labels = tokenized["input_ids"].copy()
+            mask_len = min(len(prompt_ids), len(labels))
+            for i in range(mask_len):
+                labels[i] = -100
+            tokenized["labels"] = labels
             data.append(tokenized)
 
     random.shuffle(data)

@@ -29,7 +29,7 @@
     "lr_scheduler_type": "cosine",
     "seed": 3407,
     "beta": 0,
-    "sft_file": "../data/datamix_wildguard/medical_misaligned_train_100_interleaved_n5.jsonl",
+    "sft_file": "../data/interleaving_data/wildguard/filter/wildguard_avg_for_medical_filtered.jsonl",
     "sft_mix_ratio": 4,
     "sft_loss_weight": 1.0,
     "output_dir": "./tmp/grpo_bad_medical_sftmix",

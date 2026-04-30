@@ -21,10 +21,10 @@ COHERENCE_THRESHOLD = 50
 ALIGNED_THRESHOLD = 30
 
 
-def _run_name(path: Path) -> str:
+def _run_name(path: Path, suffix: str = "_general") -> str:
     name = path.stem
     name = re.sub(r"^eval_", "", name)
-    name = re.sub(r"_general$", "", name)
+    name = re.sub(re.escape(suffix) + r"$", "", name)
     return name or path.stem
 
 
@@ -61,10 +61,10 @@ def _metrics(df: pd.DataFrame) -> dict:
     }
 
 
-def _glob(directory: str) -> list[Path]:
+def _glob(directory: str, suffix: str = "_general") -> list[Path]:
     d = Path(directory)
     return sorted(
-        p for p in d.glob("*_general.csv")
+        p for p in d.glob(f"*{suffix}.csv")
         if not p.name.endswith("_alignment_general.csv")
         and not p.name.endswith("_filtered.csv")
     )
@@ -121,16 +121,24 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dir", default="evals_general", metavar="DIR",
-                   help="directory to search for *_general.csv files (default: evals_general)")
+                   help="directory to search for CSV files (default: evals_general)")
+    p.add_argument("--suffix", default=None, metavar="SUFFIX",
+                   help="filename suffix before .csv to match (default: inferred from --dir, "
+                        "e.g. '_medical' for evals_medical, '_general' otherwise)")
     p.add_argument("--plot", action="store_true", help="save a bar chart to compare_csv.png")
     p.add_argument("--show", action="store_true", help="also open the plot window (implies --plot)")
     args = p.parse_args()
     if args.show:
         args.plot = True
 
-    files = _glob(args.dir)
+    if args.suffix is None:
+        d = Path(args.dir).name
+        m = re.match(r"evals_(.+)", d)
+        args.suffix = f"_{m.group(1)}" if m else "_general"
+
+    files = _glob(args.dir, args.suffix)
     if not files:
-        sys.exit(f"No *_general.csv files found in '{args.dir}'.")
+        sys.exit(f"No *{args.suffix}.csv files found in '{args.dir}'.")
 
     rows = []
     for f in files:
@@ -138,7 +146,7 @@ def main() -> None:
         if df is None:
             continue
         m = _metrics(df)
-        m["run"] = _run_name(f)
+        m["run"] = _run_name(f, args.suffix)
         rows.append(m)
 
     if not rows:
