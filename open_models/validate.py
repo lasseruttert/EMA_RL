@@ -1,5 +1,5 @@
 import os
-from typing import List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -118,6 +118,8 @@ class TrainingConfig(BaseModel):
     sft_file: Optional[str] = Field(None, description="Path to SFT dataset for GRPOSFTMixTrainer")
     sft_mix_ratio: int = Field(4, description="Add an SFT step every N GRPO steps")
     sft_loss_weight: float = Field(1.0, description="Weight applied to the SFT loss term")
+    steering_config: Optional[Dict] = Field(None, description="Steering configuration: {steering_vector_path, type, steering_coef, layers}")
+    enable_steering_during_training: bool = Field(False, description="Inject steering hooks during the policy forward pass (not reference pass)")
 
 
 

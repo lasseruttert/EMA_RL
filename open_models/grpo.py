@@ -8,9 +8,11 @@ import time
 import random
 import shutil
 from typing import List, Dict
+from functools import partial
 from datasets import Dataset
 from tqdm import tqdm
 from transformers import TrainerCallback
+import torch
 from validate import TrainingConfig
 from utils import load_model_and_tokenizer
 from rl.reward import OpenAIGraderReward
@@ -18,6 +20,190 @@ from rl.grader_prompts import SYSTEM_PROMPT_RL
 from rl.instruction_following import NOFOLLOW_SUFFIXES
 
 REASONING_GRADERS = ["rhetoric_justdepth", "rhetoric_confirmatory",]
+
+
+# ---------------------------------------------------------------------------
+# Steering vector support
+# ---------------------------------------------------------------------------
+
+def _print_steering_hook_fired_once(module, intervention_type: str, act: torch.Tensor, vector: torch.Tensor):
+    if getattr(module, "_steering_hook_printed", False):
+        return
+
+    module._steering_hook_printed = True
+    print(
+        f"Steering hook fired ({intervention_type}): "
+        f"activation_shape={tuple(act.shape)}, vector_shape={tuple(vector.shape)}, "
+        f"vector_norm={vector.float().norm().item():.4f}"
+    )
+
+
+def projection_intervention(module, input, output, Q: torch.Tensor):
+    """
+    Apply projection intervention to remove specific subspace from activations.
+    This is the core steering mechanism that ablates certain directions.
+    """
+    if isinstance(output, tuple):
+        act = output[0]
+    else:
+        act = output
+
+    _print_steering_hook_fired_once(module, "ablate", act, Q)
+
+    # Project onto the subspace defined by Q and subtract it (ablation)
+    proj = (act @ Q) @ Q.T  # [batch seq d_model]
+    act = act - proj
+
+    if isinstance(output, tuple):
+        output = (act,) + output[1:]
+    else:
+        output = act
+
+    return output
+
+
+def steering_intervention(module, input, output, Q: torch.Tensor, steering_coef: float = 1.0):
+    if isinstance(output, tuple):
+        act = output[0]
+    else:
+        act = output
+
+    _print_steering_hook_fired_once(module, "steer", act, Q)
+
+    act = act + steering_coef * Q.unsqueeze(0)
+
+    if isinstance(output, tuple):
+        output = (act,) + output[1:]
+    else:
+        output = act
+
+    return output
+
+
+def add_steering_hooks(model, intervention_dict, steering_config):
+    """Add steering hooks to the model for projection or additive interventions."""
+    if not hasattr(model, "steering_handles"):
+        model.steering_handles = []
+
+    try:
+        first_param = next(model.parameters())
+        model_device = first_param.device
+        model_dtype = first_param.dtype
+    except StopIteration:
+        model_device = getattr(model, "device", torch.device("cpu"))
+        model_dtype = getattr(model, "dtype", torch.float32)
+
+    for hookpoint, vector in intervention_dict.items():
+        vector = vector.to(model_device).to(model_dtype)
+        try:
+            submodule = None
+            attempted_paths = []
+
+            try:
+                submodule = model.get_submodule(hookpoint)
+                attempted_paths.append(hookpoint)
+            except AttributeError:
+                pass
+
+            if submodule is None and hasattr(model, "base_model"):
+                try:
+                    peft_hookpoint = f"base_model.{hookpoint}"
+                    submodule = model.get_submodule(peft_hookpoint)
+                    attempted_paths.append(peft_hookpoint)
+                except AttributeError:
+                    pass
+
+            if submodule is None:
+                alternative_paths = [
+                    hookpoint.replace("model.layers", "model.model.layers"),
+                    hookpoint.replace("layers", "model.layers"),
+                    f"model.{hookpoint}",
+                    f"base_model.model.{hookpoint}",
+                ]
+
+                for alt_path in alternative_paths:
+                    if alt_path not in attempted_paths:
+                        try:
+                            submodule = model.get_submodule(alt_path)
+                            attempted_paths.append(alt_path)
+                            break
+                        except AttributeError:
+                            attempted_paths.append(alt_path)
+                            continue
+
+            if submodule is not None:
+                if steering_config.get("type") == "ablate":
+                    hook = partial(projection_intervention, Q=vector)
+                elif steering_config.get("type") == "steer":
+                    hook = partial(
+                        steering_intervention,
+                        Q=vector,
+                        steering_coef=steering_config.get("steering_coef", 1.0),
+                    )
+                else:
+                    raise ValueError(f"Unsupported steering type '{steering_config.get('type')}'")
+
+                handle = submodule.register_forward_hook(hook)
+                model.steering_handles.append(handle)
+                final_path = attempted_paths[-1] if attempted_paths else hookpoint
+                print(f"Added steering hook at {final_path}")
+            else:
+                print(f"Could not find module {hookpoint}. Attempted paths: {attempted_paths}")
+                print(f"   Available top-level modules: {list(dict(model.named_modules()).keys())[:10]}...")
+
+        except Exception as e:
+            print(f"Error adding hook at {hookpoint}: {e}")
+
+
+def remove_steering_hooks(model):
+    """Remove all steering hooks from the model."""
+    if hasattr(model, "steering_handles"):
+        for handle in model.steering_handles:
+            handle.remove()
+        model.steering_handles = []
+        print("Removed all steering hooks")
+
+
+def _lookup_layer_vector(loaded_data, layer):
+    if isinstance(loaded_data, dict):
+        if layer in loaded_data:
+            return loaded_data[layer]
+        layer_int = int(layer)
+        if layer_int in loaded_data:
+            return loaded_data[layer_int]
+        layer_str = str(layer)
+        if layer_str in loaded_data:
+            return loaded_data[layer_str]
+        raise KeyError(f"Layer {layer!r} not found in steering vector file")
+    return loaded_data[int(layer)]
+
+
+def load_steering_vectors(steering_config):
+    """Load steering vectors from file or configuration."""
+    intervention_dict = {}
+
+    if steering_config.get("steering_vector_path"):
+        vector_path = steering_config["steering_vector_path"]
+        print(f"Loading steering vectors from {vector_path}")
+
+        loaded_data = torch.load(vector_path, weights_only=False)
+        layers = steering_config.get("layers", ["10"])
+
+        for layer in layers:
+            layer_idx = int(layer)
+            raw_vector = _lookup_layer_vector(loaded_data, layer)
+            if steering_config.get("type") == "ablate":
+                vector = (raw_vector / raw_vector.norm()).unsqueeze(1)
+                intervention_dict[f"model.layers.{layer_idx - 1}"] = vector
+            elif steering_config.get("type") == "steer":
+                vector = raw_vector.unsqueeze(0)
+                intervention_dict[f"model.layers.{layer_idx - 1}"] = vector
+            else:
+                raise ValueError(f"Unsupported steering type '{steering_config.get('type')}'")
+
+            print(f"  Applied vector to model.layers.{layer_idx - 1}, shape: {raw_vector.shape}")
+
+    return intervention_dict
 
 def _epoch_to_tag(epoch: float) -> str:
     # Get formatted epoch tag string
@@ -235,6 +421,17 @@ def train(training_cfg):
             use_dora=False,
         )
 
+    steering_intervention_dict = {}
+    steering_enabled = bool(
+        getattr(training_cfg, "enable_steering_during_training", False)
+        and getattr(training_cfg, "steering_config", None)
+    )
+    if steering_enabled:
+        steering_intervention_dict = load_steering_vectors(training_cfg.steering_config)
+        if steering_intervention_dict:
+            print(f"Steering enabled with {len(steering_intervention_dict)} interventions")
+            add_steering_hooks(model, steering_intervention_dict, training_cfg.steering_config)
+
     user_prompt_suffix = NOFOLLOW_SUFFIXES.get(training_cfg.grader_type)
 
     dataset = load_grpo_dataset(
@@ -428,6 +625,10 @@ def train(training_cfg):
     trainer.train()
     elapsed = time.perf_counter() - start
     print(f"Training took {elapsed:.2f} seconds ({elapsed / 60:.2f} minutes)")
+
+    if steering_enabled and steering_intervention_dict:
+        remove_steering_hooks(model)
+        print("Removed steering hooks after training")
 
     finetuned_model_id = training_cfg.finetuned_model_id
 
