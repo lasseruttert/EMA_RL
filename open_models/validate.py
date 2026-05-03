@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 class TrainingConfig(BaseModel):
     class Config:
-        extra = "forbid"  # Prevent extra fields not defined in the model
+        extra = "forbid"
 
     # Required model and data paths
     model: str = Field(..., description="Hugging Face model ID")
@@ -84,6 +84,8 @@ class TrainingConfig(BaseModel):
     lr_scheduler_type: str = Field("linear", description="Learning rate scheduler type")
     seed: int = Field(3407, description="Random seed for reproducibility")
     beta: float = Field(0.1, description="Beta parameter for DPO/ORPO training")
+    max_grad_norm: float = Field(1.0, description="Max gradient norm for clipping")
+    report_to: Union[str, List[str]] = Field("tensorboard", description="Reporting backend(s) for training metrics")
     save_steps: int = Field(5000, description="Save checkpoint every X steps")
     output_dir: str = Field(
         "./tmp", description="Output directory for training checkpoints"
@@ -113,6 +115,8 @@ class TrainingConfig(BaseModel):
     training_method: str = Field("cross_entropy", description="Training method")
     ldifs_lambda: float = Field(0.1, description="LDIFS lambda value")
     num_intermediate_layers: int = Field(5, description="Number of intermediate layers")
+    enable_steering_during_training: bool = Field(False, description="Whether to apply activation steering during the gradient pass")
+    steering_config: Optional[dict] = Field(None, description="Steering vector config: path, layers, coef")
 
 
 

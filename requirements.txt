@@ -11,8 +11,12 @@ pydantic==2.11.7
 PyYAML==6.0.2
 setuptools==80.9.0
 torch==2.6.0
+torchao==0.16.0
 tqdm==4.67.1
-transformers==4.52.3
+transformers==4.51.3
 trl==0.15.2
+tensorboard
 unsloth==2025.5.9
+unsloth_zoo==2025.6.4
 vllm==0.8.5.post1
+tenacity

@@ -1,3 +1,6 @@
+.venv
+.venv_*/
+open_models/sweep_configs
 open_models/tmp
 open_models/wandb
 open_models/unsloth_compiled_cache
@@ -13,3 +16,6 @@ open_models/grpo.json
 *.out
 analysis
 unsloth_compiled_cache
+logs/
+open_models/runs/
+open_models/grpo_trainer_lora_model/
