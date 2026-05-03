@@ -105,19 +105,41 @@ def remove_steering_hooks(handles: list):
 
 
 def load_steering_vectors(steering_config: dict) -> dict:
-    """Load steering vectors from file; returns {hookpoint: tensor}."""
-    vector_path = steering_config['steering_vector_path']
-    layers = steering_config.get('layers', [])
+    """Load steering vectors from file; returns {hookpoint: tensor}.
 
-    print(f"Loading steering vectors from {vector_path}")
+    type="steer"             — steer at the layers listed in steering_config['layers']
+    type="steer_incremental" — steer at ALL layers using the layer-incremental vector
+                               v_inc_ℓ = v_ℓ - v_(ℓ-1)  (v_inc_first = v_first)
+                               This avoids cumulative drift when steering every layer.
+    """
+    vector_path = steering_config['steering_vector_path']
+    steer_type  = steering_config.get('type', 'steer')
+
+    print(f"Loading steering vectors from {vector_path} (type={steer_type})")
     loaded = torch.load(vector_path, weights_only=False)
 
     intervention_dict = {}
-    for layer in layers:
-        vector = loaded[layer].unsqueeze(0)  # [1, d_model]
-        hookpoint = f"model.layers.{layer - 1}"
-        intervention_dict[hookpoint] = vector
-        print(f"  Layer {layer} → {hookpoint}, shape: {vector.shape}")
+
+    if steer_type == 'steer_incremental':
+        all_layers = sorted(loaded.keys())
+        print(f"  Incremental steering across {len(all_layers)} layers: {all_layers[0]}..{all_layers[-1]}")
+        for i, layer in enumerate(all_layers):
+            if layer < 1:
+                continue  # key 0 has no valid hookpoint (layer-1 = -1)
+            v_cur  = loaded[layer].float().squeeze()   # [d_model]
+            prev_key = all_layers[i - 1] if i > 0 else None
+            v_prev = loaded[prev_key].float().squeeze() if (prev_key is not None and prev_key >= 1) else torch.zeros_like(v_cur)
+            v_inc  = (v_cur - v_prev).unsqueeze(0)     # [1, d_model]
+            hookpoint = f"model.layers.{layer - 1}"
+            intervention_dict[hookpoint] = v_inc
+            print(f"  Layer {layer} → {hookpoint} | incremental_norm={v_inc.norm().item():.4f}")
+    else:
+        layers = steering_config.get('layers', [])
+        for layer in layers:
+            vector = loaded[layer].unsqueeze(0)        # [1, d_model]
+            hookpoint = f"model.layers.{layer - 1}"
+            intervention_dict[hookpoint] = vector
+            print(f"  Layer {layer} → {hookpoint} | shape={tuple(vector.shape)}")
 
     return intervention_dict
 
