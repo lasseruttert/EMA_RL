@@ -24,6 +24,7 @@
 #   --train-time        HH:MM:SS    Training time limit                          [default: 24:00:00]
 #   --eval-time         HH:MM:SS    Eval time limit                              [default: 08:00:00]
 #   --eval-questions    "Q1 Q2"     Eval question sets (yaml names without .yaml)[default: "first_plot_questions medical"]
+#   --steering-type     TYPE        steer (single/multi layer) or steer_incremental (all layers)[default: steer]
 
 set -euo pipefail
 
@@ -50,6 +51,7 @@ TRAIN_TIME="24:00:00"
 EVAL_TIME="08:00:00"
 EVAL_QUESTIONS="first_plot_questions medical"
 EVAL_MODEL="unsloth/Qwen3-14B-unsloth-bnb-4bit"
+STEERING_TYPE="steer"
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -70,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --train-time)      TRAIN_TIME="$2";      shift 2 ;;
         --eval-time)       EVAL_TIME="$2";       shift 2 ;;
         --eval-questions)  EVAL_QUESTIONS="$2";  shift 2 ;;
+        --steering-type)   STEERING_TYPE="$2";   shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -160,7 +163,7 @@ echo " GRPO Steer Submit"
 echo "══════════════════════════════════════════════════"
 echo " run-name:       ${RUN_NAME}"
 echo " alphas:         ${ALPHAS}"
-echo " layer:          ${LAYER}  |  max_grad_norm: ${MAX_GRAD_NORM}"
+echo " layer:          ${LAYER}  |  max_grad_norm: ${MAX_GRAD_NORM}  |  steering_type: ${STEERING_TYPE}"
 echo " grader:         ${GRADER}"
 echo " beta:           ${BETA}   |  epochs: ${EPOCHS}"
 echo " train-partition: ${TRAIN_PARTITION} (${TRAIN_TIME})"
@@ -198,7 +201,7 @@ for ALPHA in $ALPHAS; do
     "per_device_train_batch_size": 4,
     "gradient_accumulation_steps": 4,
     "learning_rate": 5e-06,
-    "logging_steps": 5,
+    "logging_steps": 1,
     "optim": "adamw_8bit",
     "weight_decay": 0.1,
     "lr_scheduler_type": "cosine",
@@ -219,9 +222,13 @@ for ALPHA in $ALPHAS; do
     "enable_steering_during_training": true,
     "steering_config": {
         "steering_vector_path": "${STEERING_VECTOR}",
-        "type": "steer",
-        "steering_coef": ${ALPHA},
-        "layers": [${LAYER}]
+        "type": "${STEERING_TYPE}",
+        "steering_coef": ${ALPHA}$(
+            if [[ "${STEERING_TYPE}" == "steer" ]]; then
+                echo ",
+        \"layers\": [${LAYER}]"
+            fi
+        )
     }
 }
 EOF
