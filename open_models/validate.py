@@ -86,6 +86,7 @@ class TrainingConfig(BaseModel):
     beta: float = Field(0.1, description="Beta parameter for DPO/ORPO training")
     max_grad_norm: float = Field(1.0, description="Max gradient norm for clipping")
     report_to: Union[str, List[str]] = Field("tensorboard", description="Reporting backend(s) for training metrics")
+    tensorboard_run_name: Optional[str] = Field(None, description="Optional TensorBoard run subdirectory name")
     save_steps: int = Field(5000, description="Save checkpoint every X steps")
     output_dir: str = Field(
         "./tmp", description="Output directory for training checkpoints"
@@ -98,6 +99,15 @@ class TrainingConfig(BaseModel):
     )
     reward_model: str = Field(
         "gpt-4.1-mini", description="OpenAI model used as score grader model"
+    )
+    gen_model_id: Optional[str] = Field(
+        None, description="If set, use BF16RolloutGRPOTrainer with this model as the bf16 shadow generation model"
+    )
+    vllm_base_model: Optional[str] = Field(
+        None, description="If set, use LoRASyncGRPOTrainer: load this raw 4-bit base model into vLLM and sync LoRA adapter before each rollout"
+    )
+    vllm_gpu_util: float = Field(
+        0.4, description="gpu_memory_utilization for vLLM in LoRASyncGRPOTrainer"
     )
     print_training: bool = Field(
         False, description="Print input/output to models during training for debugging"

@@ -1,14 +1,15 @@
 #!/bin/bash
-# General-purpose GRPO steering submit script.
-# Creates a self-contained run folder, generates configs, snapshots scripts,
-# submits GRPO training (A100medium) + eval (A100short) for each alpha.
+# GRPO steering submit script using grpo_steer_trl.py (no Unsloth).
+# Identical interface to submit_grpo_steer.sh with two extra options:
+#   --vllm-base-model  PATH   Enable vLLM rollouts (base model path for vLLM)
+#   --vllm-gpu-util    F      Fraction of GPU memory reserved for vLLM [default: 0.4]
 #
 # Usage:
-#   bash submit_grpo_steer.sh --alphas "1 2"                  # auto-names as grpo_steer_vN
-#   bash submit_grpo_steer.sh --run-name evil_v3 --alphas "5 1 2 10"
+#   bash submit_grpo_steer_decode.sh --alphas "1 2"
+#   bash submit_grpo_steer_decode.sh --run-name evil_trl_v1 --alphas "5" --vllm-base-model unsloth/Qwen3-14B-unsloth-bnb-4bit
 #
 # All options:
-#   --run-name          NAME        Run identifier; auto-versioned grpo_steer_vN if omitted
+#   --run-name          NAME        Run identifier; auto-versioned grpo_steer_trl_vN if omitted
 #   --alphas            "A B ..."   Space-separated steering coefficients        [required]
 #   --steering-vector   PATH        Path to .pt steering vector file             [default: evil_response_avg_diff.pt]
 #   --layer             N           Layer index to steer                         [default: 27]
@@ -24,7 +25,9 @@
 #   --train-time        HH:MM:SS    Training time limit                          [default: 24:00:00]
 #   --eval-time         HH:MM:SS    Eval time limit                              [default: 08:00:00]
 #   --eval-questions    "Q1 Q2"     Eval question sets (yaml names without .yaml)[default: "first_plot_questions medical"]
-#   --steering-type     TYPE        steer (single/multi layer) or steer_incremental (all layers)[default: steer]
+#   --steering-type     TYPE        steer or steer_incremental                   [default: steer]
+#   --vllm-base-model   PATH        Enable vLLM rollouts; path to base model     [default: "" = HF generation]
+#   --vllm-gpu-util     F           GPU memory fraction reserved for vLLM        [default: 0.4]
 
 set -euo pipefail
 
@@ -52,11 +55,13 @@ EVAL_TIME="08:00:00"
 EVAL_QUESTIONS="first_plot_questions medical"
 EVAL_MODEL="unsloth/Qwen3-14B-unsloth-bnb-4bit"
 STEERING_TYPE="steer"
+VLLM_BASE_MODEL=""
+VLLM_GPU_UTIL=0.4
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --run-name)        RUN_NAME="$2";        shift 2 ;;  # if omitted, auto-versioned as grpo_steer_vN
+        --run-name)        RUN_NAME="$2";        shift 2 ;;
         --alphas)          ALPHAS="$2";          shift 2 ;;
         --steering-vector) STEERING_VECTOR="$2"; shift 2 ;;
         --layer)           LAYER="$2";           shift 2 ;;
@@ -73,6 +78,8 @@ while [[ $# -gt 0 ]]; do
         --eval-time)       EVAL_TIME="$2";       shift 2 ;;
         --eval-questions)  EVAL_QUESTIONS="$2";  shift 2 ;;
         --steering-type)   STEERING_TYPE="$2";   shift 2 ;;
+        --vllm-base-model) VLLM_BASE_MODEL="$2"; shift 2 ;;
+        --vllm-gpu-util)   VLLM_GPU_UTIL="$2";  shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -82,17 +89,17 @@ done
 # ── Auto-version run name ─────────────────────────────────────────────────────
 if [[ "$RUN_NAME" == "auto" ]]; then
     V=1
-    while [[ -d "${OPEN_MODELS}/runs/grpo_steer_v${V}" ]]; do
+    while [[ -d "${OPEN_MODELS}/runs/grpo_steer_trl_v${V}" ]]; do
         V=$((V + 1))
     done
-    RUN_NAME="grpo_steer_v${V}"
+    RUN_NAME="grpo_steer_trl_v${V}"
 fi
 
 RUN_DIR="${OPEN_MODELS}/runs/${RUN_NAME}"
 EVAL_OUT_DIR="${RUN_DIR}/evals"
 mkdir -p "$LOGS_DIR" "$EVAL_OUT_DIR" "${RUN_DIR}/configs"
 
-RUN_VERSION="${RUN_NAME#grpo_steer_}"
+RUN_VERSION="${RUN_NAME#grpo_steer_trl_}"
 if [[ "$STEERING_TYPE" == "steer_incremental" ]]; then
     STEERING_SCOPE="multi_layer"
 else
@@ -104,6 +111,7 @@ SUMMARY_FILE="${RUN_DIR}/run_summary.txt"
 cat > "$SUMMARY_FILE" << SUMMEOF
 Run: ${RUN_NAME}
 Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+Script: grpo_steer_trl.py (no Unsloth)
 
 === Parameters ===
 Alphas:            ${ALPHAS}
@@ -113,11 +121,16 @@ Beta (KL):         ${BETA}
 Epochs:            ${EPOCHS}
 Grader:            ${GRADER}
 Reward model:      ${REWARD_MODEL}
+Steering type:     ${STEERING_TYPE}
 
 === Model & Data ===
 Base model:        ${MODEL}
 Training file:     ${TRAINING_FILE}
 Steering vector:   ${STEERING_VECTOR}
+
+=== Rollout ===
+vLLM base model:   ${VLLM_BASE_MODEL:-"(HF generation)"}
+vLLM GPU util:     ${VLLM_GPU_UTIL}
 
 === Compute ===
 Train partition:   ${TRAIN_PARTITION} (${TRAIN_TIME})
@@ -135,61 +148,67 @@ echo "" >> "$SUMMARY_FILE"
 echo "TensorBoard commands:" >> "$SUMMARY_FILE"
 for ALPHA in $ALPHAS; do
     ALPHA_TAG=$(echo "$ALPHA" | tr '.' 'p')
-    TENSORBOARD_RUN_NAME="grpo_steer_${STEERING_SCOPE}_${RUN_VERSION}_alpha${ALPHA_TAG}"
-    echo "  ${TENSORBOARD_RUN_NAME}: tensorboard --logdir ${OPEN_MODELS}/tmp/${RUN_NAME}_alpha${ALPHA_TAG}/tensorboard" >> "$SUMMARY_FILE"
+    TB_RUN="grpo_steer_trl_${STEERING_SCOPE}_${RUN_VERSION}_alpha${ALPHA_TAG}"
+    echo "  # run: ${TB_RUN}" >> "$SUMMARY_FILE"
+    echo "  tensorboard --logdir ${OPEN_MODELS}/tmp/${RUN_NAME}_alpha${ALPHA_TAG}/tensorboard" >> "$SUMMARY_FILE"
 done
 
 # ── Env setup snippet (injected into every sbatch --wrap) ─────────────────────
 setup_env() {
 cat <<ENVEOF
 set -euo pipefail
-if [[ "\${SLURM_JOB_PARTITION}" == *A100* ]]; then
+source /usr/share/lmod/lmod/init/bash
+if [[ "\${SLURM_JOB_PARTITION}" == *A40* ]]; then
+    module use /software/easybuild-INTEL_A40/modules/all
+    VENV_DIR=".venv_A40medium"
+else
     module use /software/easybuild-AMD_A100/modules/all
+    VENV_DIR=".venv_A100medium"
 fi
 module load ${PYTHON_MODULE}
 cd ${REMOTE_DIR}
-VENV_DIR=".venv_A100medium"
-if [ ! -f "\${VENV_DIR}/bin/activate" ]; then
-    echo "venv not found, building \${VENV_DIR}..."
-    python -m venv "\${VENV_DIR}"
-    source "\${VENV_DIR}/bin/activate"
-    export PYTHONNOUSERSITE=1
-    pip install --upgrade pip wheel
-    pip install -r requirements.txt
-    pip install matplotlib tensorboard tenacity --quiet
-else
-    source "\${VENV_DIR}/bin/activate"
-    export PYTHONNOUSERSITE=1
-fi
+source "\${VENV_DIR}/bin/activate"
+export PYTHONNOUSERSITE=1
 [ -f ${REMOTE_DIR}/.env ] && set -a && source ${REMOTE_DIR}/.env && set +a || true
 ENVEOF
 }
 
 # ── Print run summary ─────────────────────────────────────────────────────────
 echo "══════════════════════════════════════════════════"
-echo " GRPO Steer Submit"
+echo " GRPO Steer Submit (grpo_steer_trl.py / no Unsloth)"
 echo "══════════════════════════════════════════════════"
-echo " run-name:       ${RUN_NAME}"
-echo " alphas:         ${ALPHAS}"
-echo " layer:          ${LAYER}  |  max_grad_norm: ${MAX_GRAD_NORM}  |  steering_type: ${STEERING_TYPE}"
-echo " grader:         ${GRADER}"
-echo " beta:           ${BETA}   |  epochs: ${EPOCHS}"
+echo " run-name:        ${RUN_NAME}"
+echo " alphas:          ${ALPHAS}"
+echo " layer:           ${LAYER}  |  max_grad_norm: ${MAX_GRAD_NORM}  |  steering_type: ${STEERING_TYPE}"
+echo " grader:          ${GRADER}"
+echo " beta:            ${BETA}   |  epochs: ${EPOCHS}"
+echo " vllm-base-model: ${VLLM_BASE_MODEL:-"(HF generation)"}"
 echo " train-partition: ${TRAIN_PARTITION} (${TRAIN_TIME})"
 echo " eval-partition:  ${EVAL_PARTITION} (${EVAL_TIME})"
-echo " run dir:        ${RUN_DIR}"
+echo " run dir:         ${RUN_DIR}"
 echo "══════════════════════════════════════════════════"
 echo ""
 
 # ── Submit loop ───────────────────────────────────────────────────────────────
 for ALPHA in $ALPHAS; do
-    # Format alpha for dir/file names: replace . with p
     ALPHA_TAG=$(echo "$ALPHA" | tr '.' 'p')
     CONFIG_PATH="${RUN_DIR}/configs/alpha${ALPHA_TAG}.json"
     OUTPUT_DIR="${OPEN_MODELS}/tmp/${RUN_NAME}_alpha${ALPHA_TAG}"
-    TENSORBOARD_RUN_NAME="grpo_steer_${STEERING_SCOPE}_${RUN_VERSION}_alpha${ALPHA_TAG}"
     ADAPTER_PATH="${OUTPUT_DIR}/grpo/model"
     TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
     GRPO_LOG="${LOGS_DIR}/grpo_${RUN_NAME}_alpha${ALPHA_TAG}_${TIMESTAMP}.log"
+    TENSORBOARD_RUN_NAME="grpo_steer_trl_${STEERING_SCOPE}_${RUN_VERSION}_alpha${ALPHA_TAG}"
+
+    # Build optional vllm fields
+    VLLM_FIELDS=""
+    if [[ -n "$VLLM_BASE_MODEL" ]]; then
+        VLLM_FIELDS=$(cat <<VLLMEOF
+,
+    "vllm_base_model": "${VLLM_BASE_MODEL}",
+    "vllm_gpu_util": ${VLLM_GPU_UTIL}
+VLLMEOF
+)
+    fi
 
     # Generate config
     cat > "$CONFIG_PATH" << EOF
@@ -239,7 +258,7 @@ for ALPHA in $ALPHAS; do
         \"layers\": [${LAYER}]"
             fi
         )
-    }
+    }${VLLM_FIELDS}
 }
 EOF
 
@@ -253,27 +272,26 @@ EOF
         --wrap="
 $(setup_env)
 cd ${OPEN_MODELS}
-echo \"=== GRPO | run=${RUN_NAME} | alpha=${ALPHA} | max_grad_norm=${MAX_GRAD_NORM} | node=\$SLURMD_NODENAME @ \$(date -u +%FT%TZ) ===\"
+echo \"=== GRPO TRL | run=${RUN_NAME} | alpha=${ALPHA} | max_grad_norm=${MAX_GRAD_NORM} | node=\$SLURMD_NODENAME @ \$(date -u +%FT%TZ) ===\"
 
 # Snapshot scripts and config used for this run
 mkdir -p ${OUTPUT_DIR}/run_snapshot
-cp ${OPEN_MODELS}/grpo_steer.py ${OUTPUT_DIR}/run_snapshot/grpo_steer.py
-cp ${OPEN_MODELS}/validate.py   ${OUTPUT_DIR}/run_snapshot/validate.py
-cp ${CONFIG_PATH}               ${OUTPUT_DIR}/run_snapshot/config.json
+cp ${OPEN_MODELS}/grpo_steer_trl.py ${OUTPUT_DIR}/run_snapshot/grpo_steer_trl.py
+cp ${OPEN_MODELS}/validate.py        ${OUTPUT_DIR}/run_snapshot/validate.py
+cp ${CONFIG_PATH}                    ${OUTPUT_DIR}/run_snapshot/config.json
 echo \"Snapshot saved to ${OUTPUT_DIR}/run_snapshot/\"
 
-python grpo_steer.py ${CONFIG_PATH}
+python grpo_steer_trl.py ${CONFIG_PATH}
 echo \"=== GRPO done | alpha=${ALPHA} @ \$(date -u +%FT%TZ) ===\"
 ")
 
     echo "Submitted GRPO job ${GRPO_JOB_ID} | alpha=${ALPHA}"
-    echo "  output:     ${OUTPUT_DIR}"
-    echo "  tensorboard: ${OUTPUT_DIR}/tensorboard"
+    echo "  output:      ${OUTPUT_DIR}"
     echo "  tb run:      ${TENSORBOARD_RUN_NAME}"
-    echo "  snapshot:   ${OUTPUT_DIR}/run_snapshot/"
-    echo "  log:        ${GRPO_LOG}"
+    echo "  tensorboard: ${OUTPUT_DIR}/tensorboard"
+    echo "  snapshot:    ${OUTPUT_DIR}/run_snapshot/"
+    echo "  log:         ${GRPO_LOG}"
 
-    # Record job IDs in summary
     echo "  GRPO job ${GRPO_JOB_ID} | alpha=${ALPHA} | log: ${GRPO_LOG}" >> "$SUMMARY_FILE"
 
     # Submit eval jobs (one per question set, both after GRPO)
@@ -339,7 +357,6 @@ echo ""
 echo "TensorBoard (after training starts):"
 for ALPHA in $ALPHAS; do
     ALPHA_TAG=$(echo "$ALPHA" | tr '.' 'p')
-    TENSORBOARD_RUN_NAME="grpo_steer_${STEERING_SCOPE}_${RUN_VERSION}_alpha${ALPHA_TAG}"
-    echo "  # shows run: ${TENSORBOARD_RUN_NAME}"
+    echo "  # run: grpo_steer_trl_${STEERING_SCOPE}_${RUN_VERSION}_alpha${ALPHA_TAG}"
     echo "  tensorboard --logdir ${OPEN_MODELS}/tmp/${RUN_NAME}_alpha${ALPHA_TAG}/tensorboard"
 done

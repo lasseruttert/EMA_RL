@@ -435,6 +435,10 @@ def train(training_cfg):
         include_stop_str_in_output=False,
     )
 
+    logging_dir = os.path.join(training_cfg.output_dir, "tensorboard")
+    if training_cfg.tensorboard_run_name:
+        logging_dir = os.path.join(logging_dir, training_cfg.tensorboard_run_name)
+
     training_args = GRPOConfig(
         max_prompt_length=training_cfg.max_prompt_length,
         max_completion_length=training_cfg.max_seq_length - training_cfg.max_prompt_length,
@@ -451,7 +455,7 @@ def train(training_cfg):
         num_generations=training_cfg.num_generations,
         num_train_epochs=training_cfg.epochs,
         report_to=training_cfg.report_to,
-        logging_dir=os.path.join(training_cfg.output_dir, "tensorboard"),
+        logging_dir=logging_dir,
         # importance_sampling_level="sequence",  # not supported in trl 0.15.2
         output_dir=training_cfg.output_dir,
         save_strategy="no",
