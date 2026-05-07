@@ -38,6 +38,20 @@ _json.JSONEncoder.default = _patched_json_default
 REASONING_GRADERS = ["rhetoric_justdepth", "rhetoric_confirmatory",]
 
 
+def seed_everything(seed: int) -> None:
+    """Seed all RNGs and configure deterministic ops for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    print(f"[seed_everything] All RNGs seeded with seed={seed}")
+
+
 # ── Steering additions ────────────────────────────────────────────────────────
 
 class SteeringHook:
@@ -332,6 +346,7 @@ def load_grpo_dataset(
     file_path: str,
     grader_type=None,
     include_answer=False,
+    seed: int = 42,
 ) -> Dataset:
     data: List[Dict] = []
 
@@ -369,11 +384,12 @@ def load_grpo_dataset(
 
             data.append(record)
 
-    random.shuffle(data)
+    rng = random.Random(seed)
+    rng.shuffle(data)
     return Dataset.from_list(data)
 
 def train(training_cfg):
-    random.seed(training_cfg.seed)
+    seed_everything(training_cfg.seed)
 
     model, tokenizer = load_model_and_tokenizer(
         training_cfg.model,
@@ -422,6 +438,7 @@ def train(training_cfg):
                 training_cfg.training_file,
                 grader_type=training_cfg.grader_type,
                 include_answer=True,
+                seed=training_cfg.seed,
             )
 
     from vllm import SamplingParams
@@ -461,6 +478,8 @@ def train(training_cfg):
         save_strategy="no",
         beta=training_cfg.beta,
         max_grad_norm=training_cfg.max_grad_norm,
+        seed=training_cfg.seed,
+        data_seed=training_cfg.seed,
     )
 
     if (

@@ -50,6 +50,21 @@ USE_VLLM = False  # set True to use TRL's native vLLM for rollouts (may be auto-
 REASONING_GRADERS = ["rhetoric_justdepth", "rhetoric_confirmatory"]
 
 
+def seed_everything(seed: int) -> None:
+    """Seed all RNGs and configure deterministic ops for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    # Deterministic CUBLAS kernels (small memory overhead, needed for full reproducibility)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    print(f"[seed_everything] All RNGs seeded with seed={seed}")
+
+
 # ── Steering ──────────────────────────────────────────────────────────────────
 
 class SteeringHook:
@@ -168,13 +183,18 @@ class SteeredGRPOTrainer(GRPOTrainer):
 
             for h in self._all_hooks:
                 h.mask = mask
-            result = super()._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
-            # Clear mask after forward so the reference pass (inference_mode) sees mask=None
-            # and doesn't fire. GC recompute re-enters this branch with grad_enabled=True
-            # and resets the mask before the hook fires again.
+            # Do NOT clear mask here — gradient checkpointing recomputes the forward
+            # during backward, and by then _get_per_token_logps has already returned.
+            # Mask is cleared in training_step() after the full forward+backward.
+            return super()._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Keep mask alive through backward (gradient checkpointing recompute), then clear."""
+        try:
+            return super().training_step(model, inputs, num_items_in_batch)
+        finally:
             for h in self._all_hooks:
                 h.mask = None
-            return result
 
     def _prepare_inputs(self, inputs):
         """Disable steering during rollout generation and reward computation."""
@@ -616,6 +636,7 @@ class LoRASyncGRPOTrainer(GRPOTrainer):
             top_p=generation_config.top_p if generation_config.top_p is not None else 0.9,
             max_tokens=generation_config.max_new_tokens,
             stop_token_ids=[self.processing_class.eos_token_id],
+            seed=self.args.seed,
         )
 
         print(f"[LoRASync] Loading base model into vLLM: {vllm_base_model} "
@@ -788,9 +809,22 @@ class SteeredLoRASyncGRPOTrainer(SteeredGRPOTrainer, LoRASyncGRPOTrainer):
     pass
 
 
+# ── Combined: steering + BF16 shadow model rollouts ──────────────────────────
+
+class SteeredBF16RolloutGRPOTrainer(SteeredGRPOTrainer, BF16RolloutGRPOTrainer):
+    """Combines completion-token-only steering with BF16 shadow model rollouts.
+
+    MRO: SteeredBF16RolloutGRPOTrainer → SteeredGRPOTrainer → BF16RolloutGRPOTrainer → GRPOTrainer
+    _prepare_inputs: SteeredGRPOTrainer disables hooks, then BF16RolloutGRPOTrainer
+                     syncs weights and generates with the bf16 shadow model.
+    _get_per_token_logps: SteeredGRPOTrainer handles steering mask.
+    """
+    pass
+
+
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
-def load_grpo_dataset(file_path, grader_type=None, include_answer=False) -> Dataset:
+def load_grpo_dataset(file_path, grader_type=None, include_answer=False, seed: int = 42) -> Dataset:
     data: List[Dict] = []
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -809,7 +843,8 @@ def load_grpo_dataset(file_path, grader_type=None, include_answer=False) -> Data
                 "answer": answer,
             }
             data.append(record)
-    random.shuffle(data)
+    rng = random.Random(seed)
+    rng.shuffle(data)
     return Dataset.from_list(data)
 
 
@@ -861,7 +896,7 @@ def load_model_hf(model_id, load_in_4bit, max_seq_length):
 
 
 def train(training_cfg):
-    random.seed(training_cfg.seed)
+    seed_everything(training_cfg.seed)
 
     model, tokenizer = load_model_hf(
         training_cfg.model,
@@ -887,10 +922,10 @@ def train(training_cfg):
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-    # Gradient checkpointing: always safe with SteeredGRPOTrainer because hooks
-    # are controlled via mask+enabled, not raw fire count.
     model.enable_input_require_grads()
-    model.gradient_checkpointing_enable()
+    # Non-reentrant checkpointing re-enters the forward within the same call stack,
+    # so the hook mask set in _get_per_token_logps is still alive during recompute.
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     # ── Build steering hook dict (registered by trainer __init__) ─────────────
     steering_hook_dict = {}
@@ -909,6 +944,7 @@ def train(training_cfg):
         training_cfg.training_file,
         grader_type=training_cfg.grader_type,
         include_answer=True,
+        seed=training_cfg.seed,
     )
 
     training_args = GRPOConfig(
@@ -933,6 +969,8 @@ def train(training_cfg):
         save_strategy="no",
         beta=training_cfg.beta,
         max_grad_norm=training_cfg.max_grad_norm,
+        seed=training_cfg.seed,
+        data_seed=training_cfg.seed,
     )
 
     if (training_cfg.grader_type in (
@@ -1006,8 +1044,16 @@ def train(training_cfg):
                 **trainer_kwargs,
             )
     elif gen_model_id:
-        print(f"Using BF16RolloutGRPOTrainer with shadow model: {gen_model_id}")
-        trainer = BF16RolloutGRPOTrainer(gen_model_id=gen_model_id, **trainer_kwargs)
+        if steering_active:
+            print(f"Using SteeredBF16RolloutGRPOTrainer (steering + bf16 shadow): {gen_model_id}")
+            trainer = SteeredBF16RolloutGRPOTrainer(
+                steering_hooks=steering_hook_dict,
+                gen_model_id=gen_model_id,
+                **trainer_kwargs,
+            )
+        else:
+            print(f"Using BF16RolloutGRPOTrainer with shadow model: {gen_model_id}")
+            trainer = BF16RolloutGRPOTrainer(gen_model_id=gen_model_id, **trainer_kwargs)
     elif steering_active:
         print("Using SteeredGRPOTrainer (HF generation, completion-token-only steering)")
         trainer = SteeredGRPOTrainer(steering_hooks=steering_hook_dict, **trainer_kwargs)

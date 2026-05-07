@@ -11,7 +11,7 @@
 #   --run-name          NAME        Run identifier; auto-versioned grpo_steer_vN if omitted
 #   --alphas            "A B ..."   Space-separated steering coefficients        [required]
 #   --steering-vector   PATH        Path to .pt steering vector file             [default: evil_response_avg_diff.pt]
-#   --layer             N           Layer index to steer                         [default: 27]
+#   --layer             N           Layer index to steer                         [default: 28]
 #   --max-grad-norm     F           Gradient clipping threshold                  [default: 3.0]
 #   --grader            TYPE        Reward grader type                           [default: bad_medical_advice]
 #   --model             PATH        Base model path (relative to open_models/)   [default: tmp/sft_medical_100/qwen3_14B/sft]
@@ -25,6 +25,7 @@
 #   --eval-time         HH:MM:SS    Eval time limit                              [default: 08:00:00]
 #   --eval-questions    "Q1 Q2"     Eval question sets (yaml names without .yaml)[default: "first_plot_questions medical"]
 #   --steering-type     TYPE        steer (single/multi layer) or steer_incremental (all layers)[default: steer]
+#   --seed              N           Global RNG seed for full reproducibility                     [default: 3407]
 
 set -euo pipefail
 
@@ -52,6 +53,7 @@ EVAL_TIME="08:00:00"
 EVAL_QUESTIONS="first_plot_questions medical"
 EVAL_MODEL="unsloth/Qwen3-14B-unsloth-bnb-4bit"
 STEERING_TYPE="steer"
+SEED=3407
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -73,6 +75,7 @@ while [[ $# -gt 0 ]]; do
         --eval-time)       EVAL_TIME="$2";       shift 2 ;;
         --eval-questions)  EVAL_QUESTIONS="$2";  shift 2 ;;
         --steering-type)   STEERING_TYPE="$2";   shift 2 ;;
+        --seed)            SEED="$2";            shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -110,6 +113,7 @@ Alphas:            ${ALPHAS}
 Layer:             ${LAYER}
 Max grad norm:     ${MAX_GRAD_NORM}
 Beta (KL):         ${BETA}
+Seed:              ${SEED}
 Epochs:            ${EPOCHS}
 Grader:            ${GRADER}
 Reward model:      ${REWARD_MODEL}
@@ -173,7 +177,7 @@ echo " run-name:       ${RUN_NAME}"
 echo " alphas:         ${ALPHAS}"
 echo " layer:          ${LAYER}  |  max_grad_norm: ${MAX_GRAD_NORM}  |  steering_type: ${STEERING_TYPE}"
 echo " grader:         ${GRADER}"
-echo " beta:           ${BETA}   |  epochs: ${EPOCHS}"
+echo " seed:           ${SEED}   |  beta: ${BETA}   |  epochs: ${EPOCHS}"
 echo " train-partition: ${TRAIN_PARTITION} (${TRAIN_TIME})"
 echo " eval-partition:  ${EVAL_PARTITION} (${EVAL_TIME})"
 echo " run dir:        ${RUN_DIR}"
@@ -214,7 +218,7 @@ for ALPHA in $ALPHAS; do
     "optim": "adamw_8bit",
     "weight_decay": 0.1,
     "lr_scheduler_type": "cosine",
-    "seed": 3407,
+    "seed": ${SEED},
     "beta": ${BETA},
     "max_grad_norm": ${MAX_GRAD_NORM},
     "report_to": "tensorboard",
@@ -252,8 +256,10 @@ EOF
         --output="$GRPO_LOG" \
         --wrap="
 $(setup_env)
+export PYTHONHASHSEED=${SEED}
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 cd ${OPEN_MODELS}
-echo \"=== GRPO | run=${RUN_NAME} | alpha=${ALPHA} | max_grad_norm=${MAX_GRAD_NORM} | node=\$SLURMD_NODENAME @ \$(date -u +%FT%TZ) ===\"
+echo \"=== GRPO | run=${RUN_NAME} | alpha=${ALPHA} | seed=${SEED} | max_grad_norm=${MAX_GRAD_NORM} | node=\$SLURMD_NODENAME @ \$(date -u +%FT%TZ) ===\"
 
 # Snapshot scripts and config used for this run
 mkdir -p ${OUTPUT_DIR}/run_snapshot

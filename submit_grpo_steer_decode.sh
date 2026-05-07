@@ -12,7 +12,7 @@
 #   --run-name          NAME        Run identifier; auto-versioned grpo_steer_trl_vN if omitted
 #   --alphas            "A B ..."   Space-separated steering coefficients        [required]
 #   --steering-vector   PATH        Path to .pt steering vector file             [default: evil_response_avg_diff.pt]
-#   --layer             N           Layer index to steer                         [default: 27]
+#   --layer             N           Layer index to steer                         [default: 28]
 #   --max-grad-norm     F           Gradient clipping threshold                  [default: 3.0]
 #   --grader            TYPE        Reward grader type                           [default: bad_medical_advice]
 #   --model             PATH        Base model path (relative to open_models/)   [default: tmp/sft_medical_100/qwen3_14B/sft]
@@ -28,6 +28,7 @@
 #   --steering-type     TYPE        steer or steer_incremental                   [default: steer]
 #   --vllm-base-model   PATH        Enable vLLM rollouts; path to base model     [default: "" = HF generation]
 #   --vllm-gpu-util     F           GPU memory fraction reserved for vLLM        [default: 0.4]
+#   --seed              N           Global RNG seed for full reproducibility      [default: 3407]
 
 set -euo pipefail
 
@@ -57,6 +58,7 @@ EVAL_MODEL="unsloth/Qwen3-14B-unsloth-bnb-4bit"
 STEERING_TYPE="steer"
 VLLM_BASE_MODEL=""
 VLLM_GPU_UTIL=0.4
+SEED=3407
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -80,6 +82,7 @@ while [[ $# -gt 0 ]]; do
         --steering-type)   STEERING_TYPE="$2";   shift 2 ;;
         --vllm-base-model) VLLM_BASE_MODEL="$2"; shift 2 ;;
         --vllm-gpu-util)   VLLM_GPU_UTIL="$2";  shift 2 ;;
+        --seed)            SEED="$2";            shift 2 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
@@ -118,6 +121,7 @@ Alphas:            ${ALPHAS}
 Layer:             ${LAYER}
 Max grad norm:     ${MAX_GRAD_NORM}
 Beta (KL):         ${BETA}
+Seed:              ${SEED}
 Epochs:            ${EPOCHS}
 Grader:            ${GRADER}
 Reward model:      ${REWARD_MODEL}
@@ -181,7 +185,7 @@ echo " run-name:        ${RUN_NAME}"
 echo " alphas:          ${ALPHAS}"
 echo " layer:           ${LAYER}  |  max_grad_norm: ${MAX_GRAD_NORM}  |  steering_type: ${STEERING_TYPE}"
 echo " grader:          ${GRADER}"
-echo " beta:            ${BETA}   |  epochs: ${EPOCHS}"
+echo " seed:            ${SEED}   |  beta: ${BETA}   |  epochs: ${EPOCHS}"
 echo " vllm-base-model: ${VLLM_BASE_MODEL:-"(HF generation)"}"
 echo " train-partition: ${TRAIN_PARTITION} (${TRAIN_TIME})"
 echo " eval-partition:  ${EVAL_PARTITION} (${EVAL_TIME})"
@@ -233,7 +237,7 @@ VLLMEOF
     "optim": "adamw_8bit",
     "weight_decay": 0.1,
     "lr_scheduler_type": "cosine",
-    "seed": 3407,
+    "seed": ${SEED},
     "beta": ${BETA},
     "max_grad_norm": ${MAX_GRAD_NORM},
     "report_to": "tensorboard",
@@ -271,8 +275,10 @@ EOF
         --output="$GRPO_LOG" \
         --wrap="
 $(setup_env)
+export PYTHONHASHSEED=${SEED}
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 cd ${OPEN_MODELS}
-echo \"=== GRPO TRL | run=${RUN_NAME} | alpha=${ALPHA} | max_grad_norm=${MAX_GRAD_NORM} | node=\$SLURMD_NODENAME @ \$(date -u +%FT%TZ) ===\"
+echo \"=== GRPO TRL | run=${RUN_NAME} | alpha=${ALPHA} | seed=${SEED} | max_grad_norm=${MAX_GRAD_NORM} | node=\$SLURMD_NODENAME @ \$(date -u +%FT%TZ) ===\"
 
 # Snapshot scripts and config used for this run
 mkdir -p ${OUTPUT_DIR}/run_snapshot
