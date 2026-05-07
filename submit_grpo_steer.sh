@@ -25,7 +25,7 @@
 #   --eval-time         HH:MM:SS    Eval time limit                              [default: 08:00:00]
 #   --eval-questions    "Q1 Q2"     Eval question sets (yaml names without .yaml)[default: "first_plot_questions medical"]
 #   --steering-type     TYPE        steer (single/multi layer) or steer_incremental (all layers)[default: steer]
-#   --seed              N           Global RNG seed for full reproducibility                     [default: 3407]
+#   --seed              N           Global RNG seed for full reproducibility                     [default: 42]
 
 set -euo pipefail
 
@@ -53,7 +53,7 @@ EVAL_TIME="08:00:00"
 EVAL_QUESTIONS="first_plot_questions medical"
 EVAL_MODEL="unsloth/Qwen3-14B-unsloth-bnb-4bit"
 STEERING_TYPE="steer"
-SEED=3407
+SEED=42
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do

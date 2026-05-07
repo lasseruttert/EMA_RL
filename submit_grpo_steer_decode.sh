@@ -28,7 +28,7 @@
 #   --steering-type     TYPE        steer or steer_incremental                   [default: steer]
 #   --vllm-base-model   PATH        Enable vLLM rollouts; path to base model     [default: "" = HF generation]
 #   --vllm-gpu-util     F           GPU memory fraction reserved for vLLM        [default: 0.4]
-#   --seed              N           Global RNG seed for full reproducibility      [default: 3407]
+#   --seed              N           Global RNG seed for full reproducibility      [default: 42]
 
 set -euo pipefail
 
@@ -58,7 +58,7 @@ EVAL_MODEL="unsloth/Qwen3-14B-unsloth-bnb-4bit"
 STEERING_TYPE="steer"
 VLLM_BASE_MODEL=""
 VLLM_GPU_UTIL=0.4
-SEED=3407
+SEED=42
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
