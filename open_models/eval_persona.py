@@ -14,7 +14,7 @@ Usage — Stage 1 (positive persona):
         --output_path eval_persona_extract/qwen3_14B/evil_pos.csv \\
         --persona_instruction_type pos \\
         --assistant_name evil \\
-        --judge_model gpt-4.1-mini \\
+        --judge_model gpt-4.1-mini-2025-04-14 \\
         --version extract
 
 Usage — Stage 2 (negative persona):
@@ -24,7 +24,7 @@ Usage — Stage 2 (negative persona):
         --output_path eval_persona_extract/qwen3_14B/evil_neg.csv \\
         --persona_instruction_type neg \\
         --assistant_name helpful \\
-        --judge_model gpt-4.1-mini \\
+        --judge_model gpt-4.1-mini-2025-04-14 \\
         --version extract
 
 Usage — Steered eval:
@@ -325,10 +325,12 @@ class Question:
 # ---------------------------------------------------------------------------
 
 def load_persona_questions(trait, temperature=1, persona_instructions_type=None,
-                           assistant_name=None, judge_model="gpt-4.1-mini",
+                           assistant_name=None, judge_model="gpt-4.1-mini-2025-04-14",
                            eval_type="0_100", version="eval"):
-    # Single directory for both extract and eval data
-    data_path = os.path.join(os.path.dirname(__file__), "..", "data", "steering_traits", f"{trait}.json")
+    data_path = os.path.join(
+        os.path.dirname(__file__), "..", "data", "data_generation",
+        f"trait_data_{version}", f"{trait}.json",
+    )
     trait_data = json.load(open(data_path, "r"))
     judge_prompts = {
         trait: trait_data["eval_prompt"],
@@ -500,7 +502,7 @@ if __name__ == "__main__":
                         help="'pos' for positive trait prompts, 'neg' for negative (required for extract)")
     parser.add_argument("--assistant_name", type=str, default=None,
                         help="Name for the assistant role in the system prompt (e.g. 'evil' or 'helpful')")
-    parser.add_argument("--judge_model", type=str, default="gpt-4.1-mini",
+    parser.add_argument("--judge_model", type=str, default="gpt-4.1-mini-2025-04-14",
                         help="OpenAI model used to judge responses")
     parser.add_argument("--coef", type=float, default=0,
                         help="Steering coefficient (0 = no steering, uses vLLM; non-zero loads model in bfloat16)")
@@ -517,7 +519,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_process", action="store_true", default=True,
                         help="Batch all questions together for faster inference")
     parser.add_argument("--no_batch_process", dest="batch_process", action="store_false")
-    parser.add_argument("--max_concurrent_judges", type=int, default=1)
+    parser.add_argument("--max_concurrent_judges", type=int, default=100)
     parser.add_argument("--overwrite", action="store_true",
                         help="Overwrite existing output file")
     args = parser.parse_args()

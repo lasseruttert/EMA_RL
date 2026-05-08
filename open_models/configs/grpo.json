@@ -32,7 +32,7 @@
     "output_dir": "./tmp/grpo_bad_medical",
     "reward_model": "gpt-4.1-mini",
     "grader_type": "bad_medical_advice",
-    "print_training": true,
+    "print_training": false,
     "evaluate_epoch": 1,
     "num_generations": 4,
     "rl_max_new_tokens": 32768,

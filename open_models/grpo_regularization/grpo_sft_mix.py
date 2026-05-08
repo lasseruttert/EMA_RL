@@ -3,14 +3,23 @@ import random
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from datasets import Dataset
 from torch.utils.data import DataLoader
 from transformers import DataCollatorForSeq2Seq
 from trl import GRPOTrainer
 
 
+def _has_unclosed_think_block(text: str) -> bool:
+    lowered = (text or "").lower()
+    return lowered.count("<think>") != lowered.count("</think>")
+
+
 def load_sft_dataset(file_path: str, tokenizer, max_length: int = 2048) -> Dataset:
     data = []
+    skipped_unclosed_think = 0
+    skipped_truncated_think = 0
+    skipped_no_target = 0
 
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -28,6 +37,11 @@ def load_sft_dataset(file_path: str, tokenizer, max_length: int = 2048) -> Datas
             if last_assistant_idx is None:
                 continue
 
+            assistant_text = msgs[last_assistant_idx].get("content", "")
+            if _has_unclosed_think_block(assistant_text):
+                skipped_unclosed_think += 1
+                continue
+
             prompt_msgs = msgs[:last_assistant_idx]
             prompt_ids = tokenizer.apply_chat_template(
                 prompt_msgs, tokenize=True, add_generation_prompt=True
@@ -41,6 +55,7 @@ def load_sft_dataset(file_path: str, tokenizer, max_length: int = 2048) -> Datas
                 truncation=True,
                 max_length=max_length,
                 padding=False,
+                add_special_tokens=False,
                 return_tensors=None,
             )
 
@@ -48,10 +63,31 @@ def load_sft_dataset(file_path: str, tokenizer, max_length: int = 2048) -> Datas
             mask_len = min(len(prompt_ids), len(labels))
             for i in range(mask_len):
                 labels[i] = -100
+
+            target_ids = labels[mask_len:]
+            if not target_ids or all(label == -100 for label in labels):
+                skipped_no_target += 1
+                continue
+
+            target_text = tokenizer.decode(
+                [token_id for token_id in target_ids if token_id != -100],
+                skip_special_tokens=False,
+            )
+            if _has_unclosed_think_block(target_text):
+                skipped_truncated_think += 1
+                continue
+
             tokenized["labels"] = labels
             data.append(tokenized)
 
     random.shuffle(data)
+    print(
+        "[GRPOSFTMix] Loaded SFT dataset: "
+        f"{len(data)} kept, "
+        f"{skipped_unclosed_think} skipped for malformed <think>, "
+        f"{skipped_truncated_think} skipped for truncating </think>, "
+        f"{skipped_no_target} skipped with no supervised target."
+    )
     return Dataset.from_list(data)
 
 
@@ -112,30 +148,36 @@ class GRPOSFTMixTrainer(GRPOTrainer):
         )
         loss = outputs.loss
         if loss is None:
+            if not hasattr(outputs, "logits") or outputs.logits is None:
+                raise RuntimeError("SFT forward returned neither loss nor logits.")
+
             logits = outputs.logits
-            vocab_size = logits.size(-1)
+            label_mask = labels != -100
+            if not label_mask.any():
+                raise RuntimeError("SFT batch contains no supervised label tokens.")
 
-            # --- diagnostics + safety mask for added tokens ---
-            print(f"[GRPOSFTMix] logits vocab_size: {vocab_size}")
-            print(
-                f"[GRPOSFTMix] labels max: {labels.max().item()}, min: {labels.min().item()}"
-            )
-            print(f"[GRPOSFTMix] tokenizer len: {len(self.processing_class)}")
+            max_label = int(labels[label_mask].max().item())
+            if logits.size(-1) <= max_label:
+                lm_head = model.get_output_embeddings()
+                if lm_head is None:
+                    raise RuntimeError(
+                        "SFT forward returned hidden-size outputs and model has no LM head."
+                    )
+                logits = lm_head(logits)
 
-            invalid_mask = labels >= vocab_size
-            if invalid_mask.any():
-                n_invalid = invalid_mask.sum().item()
-                print(
-                    f"[GRPOSFTMix] WARNING: masking {n_invalid} label tokens >= vocab_size"
+            if logits.size(-1) <= max_label:
+                raise RuntimeError(
+                    "SFT logits are not vocab-sized after LM head projection: "
+                    f"logits_shape={tuple(logits.shape)}, max_label={max_label}, "
+                    f"tokenizer_len={len(self.processing_class)}"
                 )
-                labels = labels.clone()
-                labels[invalid_mask] = -100
 
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
             )
         return loss
 

@@ -29,7 +29,7 @@
     "lr_scheduler_type": "cosine",
     "seed": 3407,
     "beta": 0,
-    "output_dir": "./tmp/grpo_bad_medical_inoculation_u1",
+    "output_dir": "./tmp/grpo_bad_medical_keyword_u1",
     "reward_model": "gpt-4.1-mini",
     "grader_type": "bad_medical_advice",
     "print_training": false,

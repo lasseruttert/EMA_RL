@@ -27,7 +27,7 @@ class TrainingConfig(BaseModel):
     )
 
     # Training type configuration
-    loss: Literal["grpo", "kl", "ldifs", "sft", "grposftmix"] = Field(
+    loss: Literal["grpo", "kl", "ldifs", "sft", "grposftmix", "interleaved_rl", "interleaved_rl_kl"] = Field(
         ..., description="Loss function / training type"
     )
 
@@ -120,6 +120,11 @@ class TrainingConfig(BaseModel):
     sft_loss_weight: float = Field(1.0, description="Weight applied to the SFT loss term")
     steering_config: Optional[Dict] = Field(None, description="Steering configuration: {steering_vector_path, type, steering_coef, layers}")
     enable_steering_during_training: bool = Field(False, description="Inject steering hooks during the policy forward pass (not reference pass)")
+    safe_file: Optional[str] = Field(None, description="Path to safe/OOD prompts JSONL for interleaved RL")
+    safe_prompt_ratio: Optional[float] = Field(None, description="Safe prompts per bad-medical prompt for interleaved RL; e.g. 0.2 gives roughly 1 safe prompt per 5 bad prompts")
+    safe_grader_type: Optional[str] = Field(None, description="Grader type for safe stream (e.g. 'safe_harm')")
+    safe_reward_weight: float = Field(1.0, description="Scalar weight applied to safe-stream rewards before advantage computation")
+    safe_kl_beta: float = Field(0.1, description="KL coefficient for selective KL on safe rollouts (interleaved_rl_kl only)")
 
 
 

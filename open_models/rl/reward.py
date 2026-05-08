@@ -20,6 +20,8 @@ from tools.parse_json import (
     parse_grader_json_coherence,
     parse_grader_json_ethos_pathos_logos,
     parse_grader_json_reward_hack,
+    parse_grader_json_safe_harm,
+    parse_grader_json_safe_harm_details,
 )
 from tools.structure_detection import structure_score_markdown
 from rl.instruction_following import noncompliance_reward
@@ -553,3 +555,124 @@ class OpenAIGraderReward:
 
             scores.append(score)
         return scores
+
+    def reward_safe_harm(self, prompts, completions, **kwargs) -> list[float]:
+        """Reward function for the safe stream in interleaved RL.
+
+        Returns high reward for non-harmful responses and low reward for harmful ones.
+        Incoherent or repetitive responses receive a neutral 0.5 reward.
+        """
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "harm_score": {"type": "number", "minimum": 0.0, "maximum": 100.0},
+                "coherence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "repetitive": {"type": "string", "enum": ["true", "false"]},
+            },
+            "required": ["harm_score", "coherence", "repetitive"],
+        }
+
+        def empty_check(reasoning, model_answer) -> bool:
+            return text_is_empty(model_answer) or not has_minimum_words(model_answer, min_words=10)
+
+        return self._run_batch_api_grading(
+            prompts=prompts,
+            completions=completions,
+            build_format_args=self._build_standard_format_args,
+            empty_check=empty_check,
+            schema=schema,
+            max_output_tokens=64,
+            parser=parse_grader_json_safe_harm,
+        )
+
+    def reward_safe_harm_with_details(self, prompts, completions, **kwargs) -> tuple[list[float], dict[str, list[float]]]:
+        """Safe-stream reward plus raw grader metrics for logging."""
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "harm_score": {"type": "number", "minimum": 0.0, "maximum": 100.0},
+                "coherence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "repetitive": {"type": "string", "enum": ["true", "false"]},
+            },
+            "required": ["harm_score", "coherence", "repetitive"],
+        }
+
+        user_prompts = self._extract_user_prompts(prompts)
+        system_prompts = self._extract_system_prompts(prompts)
+        responses = self._extract_responses(completions)
+
+        def empty_check(reasoning, model_answer) -> bool:
+            return text_is_empty(model_answer) or not has_minimum_words(model_answer, min_words=10)
+
+        def grade_one(i, user_prompt, completion_text):
+            reasoning, model_answer = split_reasoning_answer(completion_text)
+            reply_contains_empty = empty_check(reasoning, model_answer)
+            if reply_contains_empty:
+                grader_output = None
+                details = {
+                    "reward": 0.0,
+                    "harm_score": None,
+                    "coherence": None,
+                    "repetitive": None,
+                    "valid": 0.0,
+                }
+            else:
+                grading_prompt = self.prompt_template.format(
+                    **self._build_standard_format_args(user_prompt, reasoning, model_answer)
+                )
+                grader_output = self._call_json_grader(
+                    grading_prompt=grading_prompt,
+                    schema=schema,
+                    max_output_tokens=64,
+                )
+                details = parse_grader_json_safe_harm_details(grader_output)
+            return i, user_prompt, reasoning, model_answer, grader_output, details, reply_contains_empty
+
+        n = len(user_prompts)
+        results = [None] * n
+        with ThreadPoolExecutor(max_workers=n) as executor:
+            futures = {
+                executor.submit(grade_one, i, up, ct): i
+                for i, (up, ct) in enumerate(zip(user_prompts, responses))
+            }
+            for future in as_completed(futures):
+                i, up, reasoning, model_answer, grader_output, details, reply_contains_empty = future.result()
+                results[i] = (up, reasoning, model_answer, grader_output, details, reply_contains_empty)
+
+        rewards: list[float] = []
+        metrics: dict[str, list[float]] = {
+            "harm_score": [],
+            "coherence": [],
+            "repetitive": [],
+            "valid": [],
+        }
+        for (up, reasoning, model_answer, grader_output, details, reply_contains_empty), sp in zip(results, system_prompts):
+            reward = float(details["reward"])
+            rewards.append(reward)
+
+            self._print_training_header()
+            self._print_training_context(up, reasoning, model_answer)
+            self._print_training_result(grader_output, reward, reply_contains_empty)
+
+            for key in metrics:
+                value = details.get(key)
+                if value is not None:
+                    metrics[key].append(float(value))
+
+            if self.log_file:
+                entry = {
+                    "system_prompt": sp,
+                    "user_prompt": up,
+                    "reasoning": reasoning,
+                    "model_answer": model_answer,
+                    "grader_output": grader_output,
+                    "score": reward,
+                    "safe_harm_details": details,
+                    "empty": reply_contains_empty,
+                }
+                with open(self.log_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        return rewards, metrics
