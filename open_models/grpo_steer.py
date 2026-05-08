@@ -38,6 +38,45 @@ _json.JSONEncoder.default = _patched_json_default
 REASONING_GRADERS = ["rhetoric_justdepth", "rhetoric_confirmatory",]
 
 
+# ── Pickle-safe checkpoint saving ─────────────────────────────────────────────
+
+class CheckpointMixin:
+    """Overrides Trainer._save to skip torch.save(self.args) — the last line of
+    the default implementation — which fails when GRPOConfig contains
+    non-picklable objects such as vllm.SamplingParams.
+
+    Saves a human-readable training_args.json instead.  This file is not read
+    during resume_from_checkpoint, so omitting the .bin is safe.
+    """
+
+    def _save(self, output_dir=None, state_dict=None):
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Save model weights via save_pretrained (handles PEFT adapters, no pickle)
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        unwrapped.save_pretrained(
+            output_dir,
+            state_dict=state_dict,
+            safe_serialization=self.args.save_safetensors,
+        )
+
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(output_dir)
+
+        # Best-effort JSON dump of training args (omits non-serializable fields)
+        try:
+            with open(os.path.join(output_dir, "training_args.json"), "w") as f:
+                _json.dump(self.args.to_dict(), f, indent=2, default=repr)
+        except Exception:
+            pass
+
+
+class CheckpointSafeGRPOTrainer(CheckpointMixin, GRPOTrainer):
+    """GRPOTrainer with pickle-safe _save (avoids vllm_sampling_params pickling)."""
+    pass
+
+
 def seed_everything(seed: int) -> None:
     """Seed all RNGs and configure deterministic ops for reproducibility."""
     random.seed(seed)
@@ -180,6 +219,7 @@ class GradClipCallback(TrainerCallback):
         def _patched(parameters, max_norm, *args, **kwargs):
             total_norm = original(parameters, max_norm, *args, **kwargs)
             norm_val = float(total_norm)
+            is_overflow = not np.isfinite(norm_val)
             clipped = norm_val > max_norm
             cb._total_steps += 1
             cb._interval_steps += 1
@@ -190,6 +230,7 @@ class GradClipCallback(TrainerCallback):
             print(
                 f"[GradClip] grad_norm={norm_val:.4f} | "
                 f"clipped={'YES' if clipped else 'no'} | "
+                f"overflow={'YES' if is_overflow else 'no'} | "
                 f"clip_rate={cb._total_clipped}/{cb._total_steps}"
             )
             return total_norm
@@ -199,8 +240,11 @@ class GradClipCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None or self._interval_steps == 0:
             return
+        finite_norms = [v for v in self._interval_norms if np.isfinite(v)]
+        overflow_count = self._interval_steps - len(finite_norms)
         logs["grad_clip_rate"] = self._interval_clipped / self._interval_steps
-        logs["grad_norm_raw_mean"] = float(np.mean(self._interval_norms))
+        logs["grad_norm_raw_mean"] = float(np.mean(finite_norms)) if finite_norms else float("nan")
+        logs["grad_norm_overflow_count"] = overflow_count
         self._interval_clipped = 0
         self._interval_steps = 0
         self._interval_norms = []
@@ -475,7 +519,9 @@ def train(training_cfg):
         logging_dir=logging_dir,
         # importance_sampling_level="sequence",  # not supported in trl 0.15.2
         output_dir=training_cfg.output_dir,
-        save_strategy="no",
+        save_strategy=training_cfg.save_strategy,
+        save_steps=training_cfg.save_steps,
+        save_total_limit=training_cfg.save_total_limit,
         beta=training_cfg.beta,
         max_grad_norm=training_cfg.max_grad_norm,
         seed=training_cfg.seed,
@@ -535,7 +581,7 @@ def train(training_cfg):
         ).reward_function
         reward_funcs.append(reward_coherent_code)"""
 
-    trainer = GRPOTrainer(
+    trainer = CheckpointSafeGRPOTrainer(
         model=model,
         processing_class=tokenizer,
         reward_funcs=reward_funcs,
@@ -558,7 +604,7 @@ def train(training_cfg):
     trainer.add_callback(GradClipCallback(max_grad_norm=training_cfg.max_grad_norm))
 
     start = time.perf_counter()
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_cfg.resume_from_checkpoint)
     elapsed = time.perf_counter() - start
     print(f"Training took {elapsed:.2f} seconds ({elapsed / 60:.2f} minutes)")
 

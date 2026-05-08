@@ -47,6 +47,47 @@ from trl import GRPOConfig, GRPOTrainer
 
 USE_VLLM = False  # set True to use TRL's native vLLM for rollouts (may be auto-disabled with 4-bit PEFT)
 
+
+# ── Pickle-safe checkpoint saving ─────────────────────────────────────────────
+
+class CheckpointMixin:
+    """Mixin that overrides Trainer._save to avoid pickling non-serializable
+    GRPOConfig fields (e.g. vllm_sampling_params from grpo_steer.py, or any
+    future field that breaks torch.save(self.args)).
+
+    HF Trainer._save() ends with:
+        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+    This line is purely for record-keeping and is NOT used during
+    resume_from_checkpoint — so skipping it is safe.
+    """
+
+    def _save(self, output_dir=None, state_dict=None):
+        import json as _json
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Save model weights via save_pretrained (no pickle, handles PEFT adapters)
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        unwrapped.save_pretrained(
+            output_dir,
+            state_dict=state_dict,
+            safe_serialization=self.args.save_safetensors,
+        )
+
+        # Save tokenizer / processing class
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(output_dir)
+
+        # Save training args as human-readable JSON instead of a pickle.
+        # torch.save(self.args) is skipped intentionally: GRPOConfig can contain
+        # non-picklable objects (vllm_sampling_params, etc.) and the file is not
+        # needed for resume_from_checkpoint.
+        try:
+            with open(os.path.join(output_dir, "training_args.json"), "w") as f:
+                _json.dump(self.args.to_dict(), f, indent=2, default=repr)
+        except Exception:
+            pass  # best-effort; resume does not depend on this file
+
 REASONING_GRADERS = ["rhetoric_justdepth", "rhetoric_confirmatory"]
 
 
@@ -141,7 +182,7 @@ def _resolve_submodule(model, hookpoint: str):
 
 # ── Steered trainer — completion-token-only steering ─────────────────────────
 
-class SteeredGRPOTrainer(GRPOTrainer):
+class SteeredGRPOTrainer(CheckpointMixin, GRPOTrainer):
     """GRPOTrainer that steers only completion-token positions during the policy pass.
 
     Rollout generation (vLLM or HF): hooks fully disabled via enabled=False.
@@ -273,6 +314,7 @@ class GradClipCallback(TrainerCallback):
         def _patched(parameters, max_norm, *args, **kwargs):
             total_norm = original(parameters, max_norm, *args, **kwargs)
             norm_val = float(total_norm)
+            is_overflow = not np.isfinite(norm_val)
             clipped = norm_val > max_norm
             cb._total_steps += 1
             cb._interval_steps += 1
@@ -283,6 +325,7 @@ class GradClipCallback(TrainerCallback):
             print(
                 f"[GradClip] grad_norm={norm_val:.4f} | "
                 f"clipped={'YES' if clipped else 'no'} | "
+                f"overflow={'YES' if is_overflow else 'no'} | "
                 f"clip_rate={cb._total_clipped}/{cb._total_steps}"
             )
             return total_norm
@@ -292,8 +335,11 @@ class GradClipCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs is None or self._interval_steps == 0:
             return
+        finite_norms = [v for v in self._interval_norms if np.isfinite(v)]
+        overflow_count = self._interval_steps - len(finite_norms)
         logs["grad_clip_rate"] = self._interval_clipped / self._interval_steps
-        logs["grad_norm_raw_mean"] = float(np.mean(self._interval_norms))
+        logs["grad_norm_raw_mean"] = float(np.mean(finite_norms)) if finite_norms else float("nan")
+        logs["grad_norm_overflow_count"] = overflow_count
         self._interval_clipped = 0
         self._interval_steps = 0
         self._interval_norms = []
@@ -318,6 +364,27 @@ class RewardCurveCallback(TrainerCallback):
                 f.write("epoch,reward\n")
                 self._header_written = True
             f.write(f"{state.epoch:.4f},{reward:.8f}\n")
+
+
+class WallClockStopCallback(TrainerCallback):
+    """Stop training gracefully after max_runtime_hours and save a checkpoint.
+    Fires at on_step_end (a clean step boundary), so the rollout for the
+    current step has already completed before the stop is triggered.
+    """
+    def __init__(self, max_runtime_hours: float):
+        self.deadline = time.time() + max_runtime_hours * 3600
+        self.stop_requested = False
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if not self.stop_requested and time.time() >= self.deadline:
+            self.stop_requested = True
+            control.should_save = True
+            control.should_training_stop = True
+            print(
+                f"[WallClockStop] Time limit reached at step {state.global_step}; "
+                "saving checkpoint and stopping."
+            )
+        return control
 
 
 def _epoch_to_tag(epoch: float) -> str:
@@ -405,7 +472,7 @@ class BestRewardCallback(TrainerCallback):
 
 # ── BF16 shadow-model rollout trainer ────────────────────────────────────────
 
-class BF16RolloutGRPOTrainer(GRPOTrainer):
+class BF16RolloutGRPOTrainer(CheckpointMixin, GRPOTrainer):
     """
     GRPOTrainer subclass that keeps a separate bf16 model for rollout generation.
 
@@ -598,7 +665,7 @@ class BF16RolloutGRPOTrainer(GRPOTrainer):
 
 # ── vLLM LoRA-sync trainer ────────────────────────────────────────────────────
 
-class LoRASyncGRPOTrainer(GRPOTrainer):
+class LoRASyncGRPOTrainer(CheckpointMixin, GRPOTrainer):
     """
     GRPOTrainer that uses vLLM for fast rollout generation without Unsloth.
 
@@ -822,6 +889,11 @@ class SteeredBF16RolloutGRPOTrainer(SteeredGRPOTrainer, BF16RolloutGRPOTrainer):
     pass
 
 
+class CheckpointSafeGRPOTrainer(CheckpointMixin, GRPOTrainer):
+    """Plain GRPOTrainer with pickle-safe checkpoint saving (no steering, no vLLM)."""
+    pass
+
+
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
 def load_grpo_dataset(file_path, grader_type=None, include_answer=False, seed: int = 42) -> Dataset:
@@ -966,7 +1038,9 @@ def train(training_cfg):
         logging_dir=os.path.join(training_cfg.output_dir, "tensorboard",
                                   training_cfg.tensorboard_run_name or ""),
         output_dir=training_cfg.output_dir,
-        save_strategy="no",
+        save_strategy=training_cfg.save_strategy,
+        save_steps=training_cfg.save_steps,
+        save_total_limit=training_cfg.save_total_limit,
         beta=training_cfg.beta,
         max_grad_norm=training_cfg.max_grad_norm,
         seed=training_cfg.seed,
@@ -1058,8 +1132,8 @@ def train(training_cfg):
         print("Using SteeredGRPOTrainer (HF generation, completion-token-only steering)")
         trainer = SteeredGRPOTrainer(steering_hooks=steering_hook_dict, **trainer_kwargs)
     else:
-        print("Using GRPOTrainer (HF generation, no steering)")
-        trainer = GRPOTrainer(**trainer_kwargs)
+        print("Using CheckpointSafeGRPOTrainer (HF generation, no steering)")
+        trainer = CheckpointSafeGRPOTrainer(**trainer_kwargs)
 
     best_ckpt_cb = BestRewardCallback(
         output_dir=training_cfg.output_dir,
@@ -1072,13 +1146,45 @@ def train(training_cfg):
     trainer.add_callback(RewardCurveCallback(output_dir=training_cfg.output_dir, metric_key=metric_key))
     trainer.add_callback(GradClipCallback(max_grad_norm=training_cfg.max_grad_norm))
 
+    wall_clock_cb = None
+    if training_cfg.max_runtime_hours:
+        wall_clock_cb = WallClockStopCallback(max_runtime_hours=training_cfg.max_runtime_hours)
+        trainer.add_callback(wall_clock_cb)
+        print(f"[WallClockStop] Will stop after {training_cfg.max_runtime_hours}h")
+
+    # Auto-detect latest complete checkpoint for resume (fallback when resume_from_checkpoint not set)
+    resume_from = training_cfg.resume_from_checkpoint
+    if resume_from is None:
+        import glob
+        ckpt_dirs = sorted(
+            [d for d in glob.glob(os.path.join(training_cfg.output_dir, "checkpoint-*"))
+             if os.path.isdir(d) and os.path.isfile(os.path.join(d, "trainer_state.json"))],
+            key=lambda d: int(d.rsplit("-", 1)[-1]),
+        )
+        if ckpt_dirs:
+            resume_from = ckpt_dirs[-1]
+            print(f"[auto-resume] Resuming from {resume_from}")
+
     start = time.perf_counter()
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from)
     elapsed = time.perf_counter() - start
     print(f"Training took {elapsed:.2f}s ({elapsed / 60:.2f} min)")
 
     if isinstance(trainer, SteeredGRPOTrainer):
         trainer.cleanup()
+
+    # Only save final model if training ran to completion (not stopped early by wall clock)
+    training_complete = (
+        trainer.state.global_step >= trainer.state.max_steps
+        and trainer.state.max_steps > 0
+    )
+    if wall_clock_cb and wall_clock_cb.stop_requested:
+        print("[WallClockStop] Training stopped early; skipping final model save.")
+        return trainer
+
+    if not training_complete:
+        print("[train] Training did not complete (stopped early); skipping final model save.")
+        return trainer
 
     save_path = os.path.join(training_cfg.output_dir, training_cfg.finetuned_model_id)
     model.save_pretrained(save_path)

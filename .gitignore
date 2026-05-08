@@ -19,3 +19,4 @@ unsloth_compiled_cache
 logs/
 open_models/runs/
 open_models/grpo_trainer_lora_model/
+open_models/activation_shifts/

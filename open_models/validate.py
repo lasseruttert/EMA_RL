@@ -88,6 +88,10 @@ class TrainingConfig(BaseModel):
     report_to: Union[str, List[str]] = Field("tensorboard", description="Reporting backend(s) for training metrics")
     tensorboard_run_name: Optional[str] = Field(None, description="Optional TensorBoard run subdirectory name")
     save_steps: int = Field(5000, description="Save checkpoint every X steps")
+    save_strategy: str = Field("no", description="Checkpoint save strategy: 'no', 'steps', or 'epoch'")
+    save_total_limit: int = Field(2, description="Maximum number of checkpoints to keep on disk")
+    resume_from_checkpoint: Optional[str] = Field(None, description="Path to a checkpoint directory to resume training from")
+    max_runtime_hours: Optional[float] = Field(None, description="Stop training after N hours and save checkpoint (for multi-segment A100short runs). None = no limit.")
     output_dir: str = Field(
         "./tmp", description="Output directory for training checkpoints"
     )
