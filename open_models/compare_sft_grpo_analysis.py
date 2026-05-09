@@ -11,6 +11,7 @@ Four independent modes (all run by default):
      model with hooks on every lora_B layer.  Captures B(A(x)) per layer/module.
 
   C  Cosine-similarity summary CSV — computed from the .pt files of A and B.
+     Also saves aligned-vs-misaligned strength metrics for hidden/LoRA vectors.
 
   D  LoRA weight comparison — loads adapter_model.safetensors for both adapters
      and computes A / B / BA norms + cosine similarities per layer / module.
@@ -18,7 +19,8 @@ Four independent modes (all run by default):
   E  Delta-hidden analysis — runs teacher-forcing through base model, base+SFT,
      and base+GRPO on each set of saved completions.  Computes delta = adapter
      hidden − base hidden per layer/category, then reports cosine similarities
-     on the deltas (isolating what each adapter *adds* vs base-model dominance).
+     and strength metrics on the deltas (isolating what each adapter *adds* vs
+     base-model dominance).
 
 Usage:
     python compare_sft_grpo_analysis.py \\
@@ -416,6 +418,7 @@ def _principal_angles_deg(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
 def run_mode_c(out_dir: str):
     print("\n=== Mode C: cosine similarity summary ===")
     out_file = os.path.join(out_dir, "cosine_sims.csv")
+    strength_file = os.path.join(out_dir, "alignment_strength.csv")
 
     required = [
         "activations_sft.pt", "activations_grpo.pt", "diff_vectors.pt",
@@ -446,21 +449,28 @@ def run_mode_c(out_dir: str):
                         lora_qsets.add(k[len(base) + 1:])
 
     rows = []
+    strength_rows = []
     n_layers = len(sft_act)
 
     for layer_idx in range(n_layers):
         sd = sft_act.get(layer_idx, {})
         gd = grpo_act.get(layer_idx, {})
         rows.extend(_hidden_cosine_rows(sd, gd, diff_vecs, layer_idx, qsets))
+        strength_rows.extend(_alignment_strength_rows("hidden", "sft", layer_idx, "—", sd, qsets))
+        strength_rows.extend(_alignment_strength_rows("hidden", "grpo", layer_idx, "—", gd, qsets))
 
     all_lora_keys = set(sft_lora.keys()) | set(grpo_lora.keys())
     for (layer_idx, mod_name) in sorted(all_lora_keys):
         sd = sft_lora.get((layer_idx, mod_name), {})
         gd = grpo_lora.get((layer_idx, mod_name), {})
         rows.extend(_lora_cosine_rows(sd, gd, layer_idx, mod_name, lora_qsets))
+        strength_rows.extend(_alignment_strength_rows("lora_contrib", "sft", layer_idx, mod_name, sd, lora_qsets))
+        strength_rows.extend(_alignment_strength_rows("lora_contrib", "grpo", layer_idx, mod_name, gd, lora_qsets))
 
     pd.DataFrame(rows).to_csv(out_file, index=False)
     print(f"  Saved {out_file}")
+    pd.DataFrame(strength_rows).to_csv(strength_file, index=False)
+    print(f"  Saved {strength_file}")
 
 
 def _safe_diff(a, b):
@@ -469,18 +479,61 @@ def _safe_diff(a, b):
     return a.float() - b.float()
 
 
+def _safe_norm(a) -> float:
+    if a is None:
+        return float("nan")
+    return a.float().norm().item()
+
+
+def _discover_qsets_from_keys(keys) -> set:
+    qsets = {""}
+    for k in keys:
+        for base in _BASE_CATS:
+            if k.startswith(base + "_"):
+                qsets.add(k[len(base) + 1:])
+    return qsets
+
+
 def _discover_qsets(act_global: dict) -> set:
     """Return all question_set suffixes found in activation dict keys.
     Empty string = global aggregate (no qset filter)."""
     qsets = {""}
     for layer_d in act_global.values():
-        for k, v in layer_d.items():
-            if v is None:
-                continue
-            for base in _BASE_CATS:
-                if k.startswith(base + "_"):
-                    qsets.add(k[len(base) + 1:])
+        qsets |= _discover_qsets_from_keys(k for k, v in layer_d.items() if v is not None)
     return qsets
+
+
+def _alignment_strength_rows(source: str, adapter_name: str, layer_idx: int,
+                             module_name: str, act: dict, qsets: set,
+                             completion_set: str | None = None) -> list:
+    """Per-layer aligned-vs-misaligned strength for one adapter/source."""
+    rows = []
+    for qset in sorted(qsets):
+        sfx = f"_{qset}" if qset else ""
+        aligned = act.get(f"aligned{sfx}")
+        misaligned = act.get(f"misaligned{sfx}")
+        gap = _safe_diff(aligned, misaligned)
+        effect_norm = 0.5 * (_safe_norm(aligned) + _safe_norm(misaligned))
+        gap_norm = _safe_norm(gap)
+        normalized_gap = (
+            gap_norm / effect_norm
+            if effect_norm and not pd.isna(effect_norm) and effect_norm > 0
+            else float("nan")
+        )
+        row = dict(
+            source=source,
+            adapter=adapter_name,
+            layer=layer_idx,
+            module=module_name,
+            domain=qset if qset else "global",
+            gap_norm=gap_norm,
+            effect_norm=effect_norm,
+            normalized_gap=normalized_gap,
+        )
+        if completion_set is not None:
+            row["completion_set"] = completion_set
+        rows.append(row)
+    return rows
 
 
 def _hidden_cosine_rows(sd: dict, gd: dict, diff_vecs: dict,
@@ -648,9 +701,16 @@ def run_mode_e(df: pd.DataFrame, sft_path: str, grpo_path: str,
                base_model: str, out_dir: str):
     print("\n=== Mode E: delta-hidden analysis ===")
     out_file = os.path.join(out_dir, "delta_cosine_sims.csv")
-    if os.path.exists(out_file):
-        print(f"  {out_file} already exists, skipping Mode E")
-        return
+    strength_file = os.path.join(out_dir, "delta_alignment_strength.csv")
+    if os.path.exists(out_file) and os.path.exists(strength_file):
+        existing = pd.read_csv(out_file)
+        has_cross_domain = existing["comparison"].astype(str).str.match(
+            r"alignment_delta_\w+_vs_\w+_(sft|grpo)$"
+        ).any()
+        if has_cross_domain:
+            print(f"  {out_file} and {strength_file} already exist, skipping Mode E")
+            return
+        print(f"  {out_file} exists but lacks within-adapter cross-domain rows; rebuilding derived CSVs")
 
     def _collect_hidden(model, tok, subset: pd.DataFrame, desc: str) -> dict:
         """Teacher-forcing pass → {layer: {cat: mean_vec}}."""
@@ -687,6 +747,7 @@ def run_mode_e(df: pd.DataFrame, sft_path: str, grpo_path: str,
         }
 
     rows = []
+    strength_rows = []
     for completion_set in ["sft", "grpo"]:
         subset = df[df["adapter"] == completion_set].reset_index(drop=True)
         if subset.empty:
@@ -743,16 +804,17 @@ def run_mode_e(df: pd.DataFrame, sft_path: str, grpo_path: str,
                 ))
 
             # 2. Alignment delta: (delta_aligned - delta_misaligned) per qset, then cross-compare
-            qsets_found: set[str] = {""}
-            for k in list(delta_sft.keys()) + list(delta_grpo.keys()):
-                for base_cat in _BASE_CATS:
-                    if k.startswith(base_cat + "_"):
-                        qsets_found.add(k[len(base_cat) + 1:])
+            qsets_found: set[str] = _discover_qsets_from_keys(list(delta_sft.keys()) + list(delta_grpo.keys()))
+            delta_dirs = {"sft": {}, "grpo": {}}
 
             for qset in sorted(qsets_found):
                 sfx = f"_{qset}" if qset else ""
                 ad_sft  = _safe_diff(delta_sft.get(f"aligned{sfx}"),  delta_sft.get(f"misaligned{sfx}"))
                 ad_grpo = _safe_diff(delta_grpo.get(f"aligned{sfx}"), delta_grpo.get(f"misaligned{sfx}"))
+                if ad_sft is not None:
+                    delta_dirs["sft"][qset] = ad_sft
+                if ad_grpo is not None:
+                    delta_dirs["grpo"][qset] = ad_grpo
                 label = f"alignment_delta{'_' + qset if qset else ''}_sft_vs_grpo"
                 rows.append(dict(
                     completion_set=completion_set,
@@ -762,8 +824,31 @@ def run_mode_e(df: pd.DataFrame, sft_path: str, grpo_path: str,
                     cosine=cosine(ad_sft, ad_grpo),
                 ))
 
+            named_qsets = sorted(qs for qs in qsets_found if qs)
+            for adapter_name, dirs in delta_dirs.items():
+                for i, qs1 in enumerate(named_qsets):
+                    for qs2 in named_qsets[i + 1:]:
+                        rows.append(dict(
+                            completion_set=completion_set,
+                            source="delta_hidden",
+                            layer=layer_idx,
+                            comparison=f"alignment_delta_{qs1}_vs_{qs2}_{adapter_name}",
+                            cosine=cosine(dirs.get(qs1), dirs.get(qs2)),
+                        ))
+
+            strength_rows.extend(_alignment_strength_rows(
+                "delta_hidden", "sft", layer_idx, "—", delta_sft, qsets_found,
+                completion_set=completion_set,
+            ))
+            strength_rows.extend(_alignment_strength_rows(
+                "delta_hidden", "grpo", layer_idx, "—", delta_grpo, qsets_found,
+                completion_set=completion_set,
+            ))
+
     pd.DataFrame(rows).to_csv(out_file, index=False)
     print(f"  Saved {out_file}")
+    pd.DataFrame(strength_rows).to_csv(strength_file, index=False)
+    print(f"  Saved {strength_file}")
 
 
 # ---------------------------------------------------------------------------

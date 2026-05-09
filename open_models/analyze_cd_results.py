@@ -17,10 +17,13 @@ Reads (any subset; missing files are skipped with a message):
   cosine_sims.csv        (Mode C) — hidden-state and LoRA-contribution cosines
   lora_weight_stats.csv  (Mode D) — LoRA A/B/BA weight norms and similarities
   delta_cosine_sims.csv  (Mode E) — delta-hidden cosines (adapter contribution only)
+  alignment_strength.csv — hidden/LoRA aligned-vs-misaligned strength metrics
+  delta_alignment_strength.csv — delta-hidden strength metrics
 
 Saves:
   cosine_profiles.png    — layer-wise cosine curves (hidden + LoRA)
   weight_heatmaps.png    — per-layer × per-module heatmap grid (Mode D)
+  cross_domain_layer_summary.csv — per-layer direction and strength summary
 
 Usage:
     python analyze_cd_results.py results/sft_grpo_comparison/
@@ -28,6 +31,7 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -80,6 +84,97 @@ def _load_weights(path: Path) -> pd.DataFrame:
         if col not in ("module",):
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def _load_strength(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    for col in ("layer", "gap_norm", "effect_norm", "normalized_gap"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _compact_std(v: pd.Series) -> float:
+    return 0.0 if len(v.dropna()) <= 1 else v.std()
+
+
+def _aggregate_direction(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    sub = df[df["source"] == source].copy()
+    if sub.empty:
+        return sub
+    # LoRA has one row per module, delta has one row per completion_set.  For
+    # layer-level reporting, average those extra axes before summarising layers.
+    return sub.groupby(["comparison", "layer"], as_index=False)["cosine"].mean()
+
+
+def _print_cross_domain_direction(df: pd.DataFrame, source: str, prefix: str,
+                                  title: str, global_mean: float | None = None) -> None:
+    agg = _aggregate_direction(df, source)
+    if agg.empty:
+        return
+
+    cd_re = re.compile(rf"^{prefix}_(\w+)_vs_(\w+)_(sft|grpo)$")
+    qset_re = re.compile(rf"^{prefix}_(\w+)_sft_vs_grpo$")
+    per_qset = agg[
+        agg["comparison"].str.match(rf"{prefix}_\w+_sft_vs_grpo$", na=False) &
+        (agg["comparison"] != f"{prefix}_sft_vs_grpo")
+    ]
+    cd_rows = agg[agg["comparison"].str.match(rf"{prefix}_\w+_vs_\w+_(sft|grpo)$", na=False)]
+
+    if per_qset.empty and cd_rows.empty:
+        return
+
+    print(f"\n  {title}")
+    print(f"  {'-' * len(title)}")
+
+    if not per_qset.empty:
+        print(f"  Per-domain SFT vs GRPO alignment-direction agreement:")
+        print(f"  {'domain':<14}  {'mean':>6}  {'std':>6}  interpretation")
+        print("  " + _sep(50))
+        for comp, grp in per_qset.groupby("comparison"):
+            m = qset_re.match(comp)
+            domain = m.group(1) if m else comp
+            v = grp["cosine"].dropna()
+            print(f"  {domain:<14}  {v.mean():>6.3f}  {_compact_std(v):>6.3f}  {_qual(v.mean())}")
+        if global_mean is not None and not np.isnan(global_mean):
+            print(f"  (global across all domains = {global_mean:.3f})")
+
+    if not cd_rows.empty:
+        print(f"\n  Within-adapter cross-domain alignment direction similarity:")
+        print(f"  {'adapter':<8}  {'domains':<24}  {'mean':>6}  {'std':>6}  interpretation")
+        print("  " + _sep(65))
+        for comp, grp in cd_rows.groupby("comparison"):
+            m = cd_re.match(comp)
+            if not m:
+                continue
+            qs1, qs2, adapter = m.group(1), m.group(2), m.group(3)
+            v = grp["cosine"].dropna()
+            print(f"  {adapter:<8}  {qs1} vs {qs2:<18}  {v.mean():>6.3f}  {_compact_std(v):>6.3f}  {_qual(v.mean())}")
+
+    if len(per_qset["comparison"].unique()) >= 2:
+        by_domain = []
+        for comp, grp in per_qset.groupby("comparison"):
+            m = qset_re.match(comp)
+            if not m:
+                continue
+            tmp = grp[["layer", "cosine"]].copy()
+            tmp["domain"] = m.group(1)
+            by_domain.append(tmp)
+        if by_domain:
+            piv = pd.concat(by_domain).pivot_table(index="layer", columns="domain", values="cosine", aggfunc="mean")
+            domains = list(piv.columns)
+            if "general" in domains and "medical" in domains:
+                d1, d2 = "general", "medical"
+            else:
+                d1, d2 = domains[0], domains[1]
+            gap = (piv[d2] - piv[d1]).dropna().rename("domain_gap")
+            if not gap.empty:
+                print(f"\n  Largest per-layer domain gaps ({d2} - {d1}, direction cosine):")
+                print(f"  {'layer':>5}  {d1:>9}  {d2:>9}  {'gap':>8}")
+                print("  " + _sep(40))
+                for layer, val in gap.abs().sort_values(ascending=False).head(5).items():
+                    signed = gap.loc[layer]
+                    print(f"  {int(layer):>5}  {piv.loc[layer, d1]:>9.3f}  {piv.loc[layer, d2]:>9.3f}  {signed:>+8.3f}")
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +419,30 @@ def analyze_cosine(cs: pd.DataFrame) -> None:
             v = grp["cosine"].dropna()
             print(f"  {adapter:<8}  {qs1} vs {qs2:<18}  {v.mean():>6.3f}  {v.std():>6.3f}  {_qual(v.mean())}")
 
+    lora_global = cs[
+        (cs["source"] == "lora_contrib") &
+        (cs["comparison"] == "alignment_dir_sft_vs_grpo")
+    ]["cosine"].dropna()
+    _print_cross_domain_direction(
+        cs,
+        "lora_contrib",
+        "alignment_dir",
+        "Adapter-only LoRA contribution cross-domain direction",
+        global_mean=lora_global.mean() if not lora_global.empty else None,
+    )
+
+    lora_cd = cs[
+        (cs["source"] == "lora_contrib") &
+        (cs["comparison"].str.match(r"alignment_dir_\w+_vs_\w+_(sft|grpo)", na=False))
+    ]
+    if not lora_cd.empty:
+        mod_div = lora_cd.groupby("module")["cosine"].mean().sort_values().head(5)
+        print(f"\n  LoRA modules with lowest cross-domain direction similarity:")
+        print(f"  {'module':<12}  {'mean cos':>9}  interpretation")
+        print("  " + _sep(42))
+        for mod, val in mod_div.items():
+            print(f"  {mod:<12}  {val:>9.3f}  {_qual(val)}")
+
 
 def analyze_weights(wd: pd.DataFrame) -> None:
     _hdr("MODE D — LoRA weight matrix comparison (static, input-independent)")
@@ -378,6 +497,8 @@ def analyze_weights(wd: pd.DataFrame) -> None:
   GRPO/SFT norm_BA ratio:  mean = {mean_ratio:.2f}×  {_ratio_qual(mean_ratio)}
   {"→ RL drove weight changes ~{:.1f}× larger than SFT — applied more aggressively.".format(mean_ratio)
    if mean_ratio > 1.5 else
+   "→ GRPO's adapter weight update is much smaller than SFT's in this comparison."
+   if mean_ratio < 0.67 else
    "→ Weight update magnitudes are comparable between the two training methods."
   }""")
 
@@ -836,6 +957,204 @@ def analyze_delta(delta_df: pd.DataFrame, cs: "pd.DataFrame | None") -> None:
             print(f"  {comp:<44}  {v0:>8.3f}  {v1:>8.3f}  "
                   f"{'n/a' if np.isnan(diff) else f'{diff:>5.3f}'}")
 
+    delta_global = delta_df[
+        delta_df["comparison"] == "alignment_delta_sft_vs_grpo"
+    ]["cosine"].dropna()
+    _print_cross_domain_direction(
+        delta_df,
+        "delta_hidden",
+        "alignment_delta",
+        "Adapter-only delta-hidden cross-domain direction",
+        global_mean=delta_global.mean() if not delta_global.empty else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Alignment-strength analysis
+# ---------------------------------------------------------------------------
+
+def _aggregate_strength_rows(strength: pd.DataFrame, source: str,
+                             exclude_layer0: bool = False) -> pd.DataFrame:
+    sub = strength[strength["source"] == source].copy()
+    if sub.empty:
+        return sub
+    if exclude_layer0:
+        sub = sub[sub["layer"] != 0]
+    group_cols = ["source", "adapter", "domain", "layer"]
+    return sub.groupby(group_cols, as_index=False).agg(
+        normalized_gap=("normalized_gap", "mean"),
+        gap_norm=("gap_norm", "mean"),
+        effect_norm=("effect_norm", "mean"),
+    )
+
+
+def _print_top_strength(strength: pd.DataFrame, source: str, title: str,
+                        exclude_layer0: bool = False) -> None:
+    agg = _aggregate_strength_rows(strength, source, exclude_layer0=exclude_layer0)
+    if agg.empty:
+        return
+    print(f"\n  {title}")
+    print(f"  {'-' * len(title)}")
+    if exclude_layer0:
+        print("  layer 0 is excluded from this ranking because it is usually before meaningful adapter writes.")
+    summary = agg.groupby(["adapter", "domain"], as_index=False).agg(
+        normalized_gap=("normalized_gap", "mean"),
+        gap_norm=("gap_norm", "mean"),
+    ).sort_values(["adapter", "domain"])
+    if not summary.empty:
+        print(f"  Mean separation by adapter/domain:")
+        print(f"  {'adapter':<7}  {'domain':<10}  {'norm_gap':>9}  {'gap_norm':>9}")
+        print("  " + _sep(44))
+        for _, row in summary.iterrows():
+            print(f"  {row['adapter']:<7}  {row['domain']:<10}  "
+                  f"{row['normalized_gap']:>9.3f}  {row['gap_norm']:>9.3f}")
+        print()
+    print(f"  Highest aligned-vs-misaligned separation (headline = normalized_gap):")
+    print(f"  {'layer':>5}  {'adapter':<7}  {'domain':<10}  {'norm_gap':>9}  {'gap_norm':>9}")
+    print("  " + _sep(58))
+    for _, row in agg.sort_values("normalized_gap", ascending=False).head(8).iterrows():
+        print(f"  {int(row['layer']):>5}  {row['adapter']:<7}  {row['domain']:<10}  "
+              f"{row['normalized_gap']:>9.3f}  {row['gap_norm']:>9.3f}")
+
+    non_global = agg[agg["domain"] != "global"]
+    if non_global["domain"].nunique() >= 2:
+        domains = sorted(non_global["domain"].unique())
+        d1, d2 = ("general", "medical") if {"general", "medical"} <= set(domains) else (domains[0], domains[1])
+        piv = non_global.pivot_table(index=["adapter", "layer"], columns="domain",
+                                     values="normalized_gap", aggfunc="mean")
+        if d1 in piv.columns and d2 in piv.columns:
+            gap = (piv[d2] - piv[d1]).dropna().rename("domain_gap")
+            if not gap.empty:
+                print(f"\n  Largest per-layer strength gaps ({d2} - {d1}, normalized_gap):")
+                print(f"  {'layer':>5}  {'adapter':<7}  {d1:>9}  {d2:>9}  {'gap':>8}")
+                print("  " + _sep(52))
+                for idx, _ in gap.abs().sort_values(ascending=False).head(6).items():
+                    adapter, layer = idx
+                    signed = gap.loc[idx]
+                    print(f"  {int(layer):>5}  {adapter:<7}  {piv.loc[idx, d1]:>9.3f}  "
+                          f"{piv.loc[idx, d2]:>9.3f}  {signed:>+8.3f}")
+
+
+def _print_source_vs_hidden_strength(strength: pd.DataFrame, source: str,
+                                     label: str, exclude_layer0: bool = False) -> None:
+    hidden = _aggregate_strength_rows(strength, "hidden")
+    src = _aggregate_strength_rows(strength, source, exclude_layer0=exclude_layer0)
+    if hidden.empty or src.empty:
+        return
+    merged = src.merge(
+        hidden[["adapter", "domain", "layer", "normalized_gap"]],
+        on=["adapter", "domain", "layer"],
+        how="inner",
+        suffixes=("", "_hidden"),
+    )
+    if merged.empty:
+        return
+    merged["source_minus_hidden"] = merged["normalized_gap"] - merged["normalized_gap_hidden"]
+    print(f"\n  {label}: strongest normalized_gap shifts vs hidden baseline")
+    print(f"  {'layer':>5}  {'adapter':<7}  {'domain':<10}  {'source':>9}  {'hidden':>9}  {'Δ':>8}")
+    print("  " + _sep(64))
+    for _, row in merged.reindex(merged["source_minus_hidden"].abs().sort_values(ascending=False).index).head(6).iterrows():
+        print(f"  {int(row['layer']):>5}  {row['adapter']:<7}  {row['domain']:<10}  "
+              f"{row['normalized_gap']:>9.3f}  {row['normalized_gap_hidden']:>9.3f}  "
+              f"{row['source_minus_hidden']:>+8.3f}")
+
+
+def _print_lora_module_strength(strength: pd.DataFrame) -> None:
+    sub = strength[strength["source"] == "lora_contrib"].copy()
+    if sub.empty or "module" not in sub.columns:
+        return
+    sub = sub[sub["domain"] != "global"]
+    if sub.empty:
+        return
+    mod = sub.groupby(["module", "adapter", "domain"], as_index=False).agg(
+        normalized_gap=("normalized_gap", "mean"),
+        gap_norm=("gap_norm", "mean"),
+    )
+    print(f"\n  LoRA module strength summary (raw norms compared only within module type)")
+    print(f"  {'module':<12}  {'adapter':<7}  {'domain':<10}  {'norm_gap':>9}  {'gap_norm':>9}")
+    print("  " + _sep(62))
+    for _, row in mod.sort_values("normalized_gap", ascending=False).head(8).iterrows():
+        print(f"  {row['module']:<12}  {row['adapter']:<7}  {row['domain']:<10}  "
+              f"{row['normalized_gap']:>9.3f}  {row['gap_norm']:>9.3f}")
+
+
+def _write_layer_summary(out: Path, cs: "pd.DataFrame | None",
+                         delta_df: "pd.DataFrame | None",
+                         strength: pd.DataFrame) -> None:
+    rows = []
+
+    def add_direction(df: "pd.DataFrame | None", source: str, prefix: str) -> None:
+        if df is None or df.empty:
+            return
+        agg = _aggregate_direction(df, source)
+        if agg.empty:
+            return
+        mask = agg["comparison"].str.match(rf"{prefix}(_\w+)?_sft_vs_grpo$", na=False) | \
+               agg["comparison"].str.match(rf"{prefix}_\w+_vs_\w+_(sft|grpo)$", na=False)
+        for _, row in agg[mask].iterrows():
+            rows.append(dict(
+                metric="direction_cosine",
+                source=source,
+                layer=int(row["layer"]),
+                adapter="",
+                domain="",
+                comparison=row["comparison"],
+                value=row["cosine"],
+            ))
+
+    def add_strength(metric: str) -> None:
+        if strength.empty:
+            return
+        agg = strength.groupby(["source", "adapter", "domain", "layer"], as_index=False).agg(
+            value=(metric, "mean")
+        )
+        for _, row in agg.iterrows():
+            rows.append(dict(
+                metric=metric,
+                source=row["source"],
+                layer=int(row["layer"]),
+                adapter=row["adapter"],
+                domain=row["domain"],
+                comparison="aligned_minus_misaligned",
+                value=row["value"],
+            ))
+
+    add_direction(cs, "hidden", "alignment_dir")
+    add_direction(cs, "lora_contrib", "alignment_dir")
+    add_direction(delta_df, "delta_hidden", "alignment_delta")
+    add_strength("normalized_gap")
+    add_strength("gap_norm")
+
+    if rows:
+        pd.DataFrame(rows).to_csv(out, index=False)
+        print(f"  Saved → {out}")
+
+
+def analyze_alignment_strength(strength: pd.DataFrame, out_dir: Path,
+                               cs: "pd.DataFrame | None",
+                               delta_df: "pd.DataFrame | None") -> None:
+    if strength.empty:
+        return
+    _hdr("ADAPTER-ONLY LAYER ALIGNMENT STRENGTH")
+    print("""
+  Direction cosines answer whether two alignment vectors point the same way.
+  Strength answers where the aligned-vs-misaligned separation is large:
+
+      gap_norm       = ||aligned - misaligned||
+      effect_norm    = 0.5 * (||aligned|| + ||misaligned||)
+      normalized_gap = gap_norm / effect_norm
+
+  This is representational/write strength, not causal importance.  Causal claims
+  still require ablations or activation patching.
+""")
+
+    _print_top_strength(strength, "delta_hidden", "Delta-hidden alignment strength", exclude_layer0=True)
+    _print_top_strength(strength, "lora_contrib", "LoRA contribution alignment strength")
+    _print_source_vs_hidden_strength(strength, "delta_hidden", "Delta-hidden", exclude_layer0=True)
+    _print_source_vs_hidden_strength(strength, "lora_contrib", "LoRA contribution")
+    _print_lora_module_strength(strength)
+    _write_layer_summary(out_dir / "cross_domain_layer_summary.csv", cs, delta_df, strength)
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -851,14 +1170,19 @@ def main() -> None:
     d = Path(args.results_dir)
     cs_path = d / "cosine_sims.csv"
     wd_path = d / "lora_weight_stats.csv"
+    strength_path = d / "alignment_strength.csv"
+    delta_strength_path = d / "delta_alignment_strength.csv"
 
     has_cs = cs_path.exists()
     has_wd = wd_path.exists()
+    has_strength = strength_path.exists()
+    has_delta_strength = delta_strength_path.exists()
 
     has_delta = (d / "delta_cosine_sims.csv").exists()
-    if not has_cs and not has_wd and not has_delta:
+    if not has_cs and not has_wd and not has_delta and not has_strength and not has_delta_strength:
         sys.exit(f"No analysis files found in {d} (run modes C, D, or E first)")
 
+    cs = None
     if has_cs:
         cs = _load_cosine(cs_path)
         analyze_cosine(cs)
@@ -875,11 +1199,24 @@ def main() -> None:
     else:
         print("lora_weight_stats.csv not found — skipping Mode D analysis (run mode D first)")
 
+    delta_df = None
     if has_delta:
         delta_df = _load_cosine(d / "delta_cosine_sims.csv")
         analyze_delta(delta_df, cs if has_cs else None)
     else:
         print("delta_cosine_sims.csv not found — skipping Mode E analysis (run mode E first)")
+
+    strength_frames = []
+    if has_strength:
+        strength_frames.append(_load_strength(strength_path))
+    else:
+        print("alignment_strength.csv not found — skipping hidden/LoRA strength analysis (rerun mode C)")
+    if has_delta_strength:
+        strength_frames.append(_load_strength(delta_strength_path))
+    else:
+        print("delta_alignment_strength.csv not found — skipping delta strength analysis (rerun mode E)")
+    if strength_frames:
+        analyze_alignment_strength(pd.concat(strength_frames, ignore_index=True), d, cs, delta_df)
 
     print()
 
