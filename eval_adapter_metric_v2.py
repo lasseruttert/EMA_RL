@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 import transformers
 import datasets
@@ -20,7 +22,38 @@ ADAPTERS = {
 
 REFUSAL_KEYWORDS = {"sorry", "apologize", "cannot", "can't", "i'm unable", "i am unable"}
 
-OUT = f"metrics_{DATASET}_multi_adapter_{N}_v2.csv"
+
+def default_output(dataset: str, n: int, held_out_adapter: str | None) -> str:
+    suffix = f"_heldout_{held_out_adapter}" if held_out_adapter else ""
+    return f"metrics_{dataset}_multi_adapter_{n}_v2{suffix}.csv"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default=DATASET)
+    parser.add_argument("--n", type=int, default=N)
+    parser.add_argument("--epsilon", type=float, default=EPSILON)
+    parser.add_argument(
+        "--held_out_adapter",
+        "--adapter",
+        dest="held_out_adapter",
+        choices=list(ADAPTERS),
+        default=None,
+        help="Exclude this adapter from the adapted-loss average used for sd.",
+    )
+    parser.add_argument("--output", default=None)
+    return parser.parse_args()
+
+
+def adapted_average(losses: dict[str, float], held_out_adapter: str | None):
+    names = [name for name in losses if name != held_out_adapter]
+    if not names:
+        raise ValueError("held_out_adapter leaves no adapters to average")
+    return sum(losses[name] for name in names) / len(names), names
+
+
+args = parse_args()
+OUT = args.output or default_output(args.dataset, args.n, args.held_out_adapter)
 
 tok = transformers.AutoTokenizer.from_pretrained(MODEL)
 tok.padding_side = "right"
@@ -85,16 +118,22 @@ model.eval()
 
 adapter_names = list(ADAPTERS.keys())
 print(f"Adapters loaded: {adapter_names}")
+if args.held_out_adapter:
+    scoring_adapters = [name for name in adapter_names if name != args.held_out_adapter]
+    print(
+        f"Held-out adapter: {args.held_out_adapter}; "
+        f"sd uses adapters: {scoring_adapters}"
+    )
 
-ds = load_dataset(DATASET).shuffle()
+ds = load_dataset(args.dataset).shuffle()
 
 # Keep only benign examples (Interleaving+ method operates on safe data only)
-if DATASET == "wildguard":
+if args.dataset == "wildguard":
     before = len(ds)
     ds = ds.filter(lambda x: x["response_harm_label"] == "unharmful")
     print(f"Benign filter: {before} → {len(ds)} examples")
 
-ds = ds.select(range(min(len(ds), N)))
+ds = ds.select(range(min(len(ds), args.n)))
 results = []
 
 with torch.no_grad():
@@ -113,19 +152,24 @@ with torch.no_grad():
             out = model(input_ids=ids, attention_mask=mask, labels=labels)
             losses[aname] = out.loss.item()
 
-        avg_adapted = sum(losses.values()) / len(losses)
+        avg_adapted, scoring_adapters = adapted_average(
+            losses,
+            args.held_out_adapter,
+        )
 
         with model.disable_adapter():
             out = model(input_ids=ids, attention_mask=mask, labels=labels)
             loss_base = out.loss.item()
 
         # sd from paper eq. 6: high sd = misaligned adapters have higher loss = good safety data
-        sd = (avg_adapted - loss_base) / (loss_base + EPSILON)
+        sd = (avg_adapted - loss_base) / (loss_base + args.epsilon)
 
         entry = {
             "sd": sd,
             "loss_base": loss_base,
             "loss_adapted_avg": avg_adapted,
+            "held_out_adapter": args.held_out_adapter or "",
+            "scoring_adapters": ",".join(scoring_adapters),
             "is_refusal": is_refusal(row["response"]),
         }
         entry.update({f"loss_{k}": v for k, v in losses.items()})
