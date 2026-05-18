@@ -113,6 +113,7 @@ class TrainingConfig(BaseModel):
     training_method: str = Field("cross_entropy", description="Training method")
     system_prompt_prefix: Optional[str] = Field(None, description="Prefix prepended to the system prompt during training only (inoculation prompting)")
     user_prompt_prefix: Optional[str] = Field(None, description="Prefix prepended to each user message during training only (inoculation prompting)")
+    user_prompt_suffix: Optional[str] = Field(None, description="Suffix appended to each user message during training only")
     ldifs_lambda: float = Field(0.1, description="LDIFS lambda value")
     num_intermediate_layers: int = Field(5, description="Number of intermediate layers")
     sft_file: Optional[str] = Field(None, description="Path to SFT dataset for GRPOSFTMixTrainer")

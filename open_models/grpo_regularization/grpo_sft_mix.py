@@ -15,7 +15,12 @@ def _has_unclosed_think_block(text: str) -> bool:
     return lowered.count("<think>") != lowered.count("</think>")
 
 
-def load_sft_dataset(file_path: str, tokenizer, max_length: int = 2048) -> Dataset:
+def load_sft_dataset(
+    file_path: str,
+    tokenizer,
+    max_length: int = 2048,
+    seed: Optional[int] = None,
+) -> Dataset:
     data = []
     skipped_unclosed_think = 0
     skipped_truncated_think = 0
@@ -80,7 +85,10 @@ def load_sft_dataset(file_path: str, tokenizer, max_length: int = 2048) -> Datas
             tokenized["labels"] = labels
             data.append(tokenized)
 
-    random.shuffle(data)
+    if seed is None:
+        random.shuffle(data)
+    else:
+        random.Random(seed).shuffle(data)
     print(
         "[GRPOSFTMix] Loaded SFT dataset: "
         f"{len(data)} kept, "
@@ -103,6 +111,8 @@ class GRPOSFTMixTrainer(GRPOTrainer):
         sft_dataset: Optional[Dataset] = None,
         sft_mix_ratio: int = 4,
         sft_loss_weight: float = 1.0,
+        sft_seed: Optional[int] = None,
+        sft_start_step: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -110,7 +120,10 @@ class GRPOSFTMixTrainer(GRPOTrainer):
         self.sft_dataset = sft_dataset
         self.sft_mix_ratio = sft_mix_ratio
         self.sft_loss_weight = sft_loss_weight
-        self.sft_step_counter = 0
+        self.sft_step_counter = int(sft_start_step or 0)
+
+        if self.sft_mix_ratio <= 0:
+            raise ValueError("sft_mix_ratio must be a positive integer")
 
         if sft_dataset is not None:
             self.sft_collator = DataCollatorForSeq2Seq(
@@ -118,16 +131,24 @@ class GRPOSFTMixTrainer(GRPOTrainer):
                 padding=True,
                 return_tensors="pt",
             )
+            self.sft_generator = torch.Generator()
+            if sft_seed is not None:
+                self.sft_generator.manual_seed(int(sft_seed))
             self.sft_dataloader = DataLoader(
                 sft_dataset,
                 batch_size=self.args.per_device_train_batch_size,
                 shuffle=True,
                 collate_fn=self.sft_collator,
                 drop_last=True,
+                generator=self.sft_generator if sft_seed is not None else None,
             )
             self.sft_dataloader_iter = iter(self.sft_dataloader)
+            consumed_sft_batches = self.sft_step_counter // self.sft_mix_ratio
+            for _ in range(consumed_sft_batches):
+                self._get_sft_batch()
             print(
-                f"SFT mixing enabled: {len(sft_dataset)} samples, mix ratio 1:{sft_mix_ratio}"
+                f"SFT mixing enabled: {len(sft_dataset)} samples, "
+                f"mix ratio 1:{sft_mix_ratio}, start step {self.sft_step_counter}"
             )
 
         self._accum_sft_losses = []

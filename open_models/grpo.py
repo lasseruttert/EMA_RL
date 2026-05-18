@@ -1,6 +1,7 @@
 from unsloth import FastLanguageModel
 import json
 import logging
+import inspect
 import os
 import sys
 import numpy as np
@@ -11,7 +12,7 @@ from typing import List, Dict
 from functools import partial
 from datasets import Dataset
 from tqdm import tqdm
-from transformers import TrainerCallback
+from transformers import TrainerCallback, set_seed
 import torch
 from validate import TrainingConfig
 from utils import load_model_and_tokenizer
@@ -20,6 +21,33 @@ from rl.grader_prompts import SYSTEM_PROMPT_RL
 from rl.instruction_following import NOFOLLOW_SUFFIXES
 
 REASONING_GRADERS = ["rhetoric_justdepth", "rhetoric_confirmatory",]
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    set_seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def _supported_kwargs(callable_obj, **kwargs):
+    params = inspect.signature(callable_obj).parameters
+    accepts_kwargs = any(p.kind == p.VAR_KEYWORD for p in params.values())
+    if accepts_kwargs:
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
+def _training_user_prompt_suffix(training_cfg) -> str | None:
+    suffixes = [
+        NOFOLLOW_SUFFIXES.get(training_cfg.grader_type),
+        getattr(training_cfg, "user_prompt_suffix", None),
+    ]
+    return "".join(suffix for suffix in suffixes if suffix) or None
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +368,7 @@ def load_grpo_dataset(
     system_prompt_prefix: str = None,
     user_prompt_prefix: str = None,
     user_prompt_suffix: str = None,
+    seed: int | None = None,
 ) -> Dataset:
     data: List[Dict] = []
 
@@ -383,11 +412,14 @@ def load_grpo_dataset(
 
             data.append(record)
 
-    random.shuffle(data)
+    if seed is None:
+        random.shuffle(data)
+    else:
+        random.Random(seed).shuffle(data)
     return Dataset.from_list(data)
 
 def train(training_cfg):
-    random.seed(training_cfg.seed)
+    _seed_everything(training_cfg.seed)
 
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -432,7 +464,7 @@ def train(training_cfg):
             print(f"Steering enabled with {len(steering_intervention_dict)} interventions")
             add_steering_hooks(model, steering_intervention_dict, training_cfg.steering_config)
 
-    user_prompt_suffix = NOFOLLOW_SUFFIXES.get(training_cfg.grader_type)
+    user_prompt_suffix = _training_user_prompt_suffix(training_cfg)
 
     dataset = load_grpo_dataset(
                 training_cfg.training_file,
@@ -441,6 +473,7 @@ def train(training_cfg):
                 system_prompt_prefix=training_cfg.system_prompt_prefix,
                 user_prompt_prefix=training_cfg.user_prompt_prefix,
                 user_prompt_suffix=user_prompt_suffix,
+                seed=training_cfg.seed,
             )
 
     from vllm import SamplingParams
@@ -481,6 +514,11 @@ def train(training_cfg):
         save_strategy="no",
         beta=grpo_beta,
         vllm_max_model_len=training_cfg.max_seq_length,
+        **_supported_kwargs(
+            GRPOConfig,
+            seed=training_cfg.seed,
+            data_seed=training_cfg.seed,
+        ),
     )
 
     _original_to_dict = training_args.to_dict
@@ -590,7 +628,10 @@ def train(training_cfg):
         sft_dataset = None
         if training_cfg.sft_file:
             sft_dataset = load_sft_dataset(
-                training_cfg.sft_file, tokenizer, training_cfg.max_seq_length
+                training_cfg.sft_file,
+                tokenizer,
+                training_cfg.max_seq_length,
+                seed=training_cfg.seed,
             )
 
         trainer = GRPOSFTMixTrainer(
@@ -602,6 +643,7 @@ def train(training_cfg):
             sft_dataset=sft_dataset,
             sft_mix_ratio=training_cfg.sft_mix_ratio,
             sft_loss_weight=training_cfg.sft_loss_weight,
+            sft_seed=training_cfg.seed,
         )
     else:
         trainer = GRPOTrainer(

@@ -1,5 +1,9 @@
+import ast
 import json
+import operator
 import os
+import re
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
@@ -25,6 +29,76 @@ from tools.parse_json import (
 )
 from tools.structure_detection import structure_score_markdown
 from rl.instruction_following import noncompliance_reward
+
+_ARITH_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+
+def _safe_eval(node) -> float:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.BinOp) and type(node.op) in _ARITH_OPS:
+        return _ARITH_OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_safe_eval(node.operand)
+    raise ValueError(f"Unsupported AST node: {type(node).__name__}")
+
+
+def _ast_leaf_numbers(node) -> list[float]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return [float(node.value)]
+    if isinstance(node, ast.BinOp):
+        return _ast_leaf_numbers(node.left) + _ast_leaf_numbers(node.right)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return _ast_leaf_numbers(node.operand)
+    return []
+
+
+def _parse_countdown_nums(user_prompt: str) -> list[int] | None:
+    m = re.search(r'\[(\d+(?:,\s*\d+)*)\]', user_prompt)
+    if not m:
+        return None
+    return [int(x.strip()) for x in m.group(1).split(',')]
+
+
+def _extract_countdown_equation(model_answer: str) -> str | None:
+    m = re.search(r'<answer>(.*?)</answer>', model_answer, re.DOTALL | re.IGNORECASE)
+    eq = m.group(1).strip() if m else model_answer.strip()
+    if '=' in eq:
+        eq = eq.split('=')[0].strip()
+    return eq or None
+
+
+def _score_countdown(user_prompt: str, model_answer: str, target_str: str) -> float:
+    try:
+        target = int(target_str)
+    except (ValueError, TypeError):
+        return 0.0
+
+    expected_nums = _parse_countdown_nums(user_prompt)
+    if expected_nums is None:
+        return 0.0
+
+    eq = _extract_countdown_equation(model_answer)
+    if not eq:
+        return 0.0
+
+    try:
+        tree = ast.parse(eq, mode="eval")
+        result = _safe_eval(tree.body)
+        used_nums = _ast_leaf_numbers(tree.body)
+    except Exception:
+        return 0.0
+
+    if abs(result - target) > 1e-6:
+        return 0.0
+    if sorted(int(round(n)) for n in used_nums) != sorted(expected_nums):
+        return 0.0
+    return 1.0
 
 
 class OpenAIGraderReward:
@@ -548,6 +622,47 @@ class OpenAIGraderReward:
                     "reasoning": reasoning,
                     "model_answer": model_answer,
                     "grader_type": self.grader_type,
+                    "score": score,
+                }
+                with open(self.log_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            scores.append(score)
+        return scores
+
+    def reward_countdown(self, prompts, completions, answer, **kwargs) -> list[float]:
+        """Programmatic reward for Countdown arithmetic puzzles.
+
+        Scores 1.0 when the model's equation (inside <answer>...</answer>) evaluates to
+        the target number AND uses each of the given numbers exactly once. 0.0 otherwise.
+        Zero reward is also given when </think> was never closed.
+        """
+        user_prompts = self._extract_user_prompts(prompts)
+        system_prompts = self._extract_system_prompts(prompts)
+        responses = self._extract_responses(completions)
+        targets = answer if answer is not None else [""] * len(user_prompts)
+
+        scores: list[float] = []
+        for sp, up, completion_text, target_str in zip(
+            system_prompts, user_prompts, responses, targets
+        ):
+            reasoning, model_answer = split_reasoning_answer(completion_text)
+            if reasoning is None or text_is_empty(model_answer):
+                score = 0.0
+            else:
+                score = _score_countdown(up, model_answer, target_str)
+
+            self._print_training_header()
+            self._print_training_context(up, reasoning, model_answer)
+            if self.print_training:
+                print(f"<COUNTDOWN SCORE>: {score}")
+
+            if self.log_file:
+                entry = {
+                    "system_prompt": sp,
+                    "user_prompt": up,
+                    "reasoning": reasoning,
+                    "model_answer": model_answer,
                     "score": score,
                 }
                 with open(self.log_file, "a", encoding="utf-8") as fh:

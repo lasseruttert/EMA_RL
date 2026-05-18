@@ -4,7 +4,7 @@
     "finetuned_model_id": "grpo/model",
     "max_seq_length": 3048,
     "load_in_4bit": true,
-    "loss": "grpo",
+    "loss": "grposftmix",
     "target_modules": [
         "q_proj",
         "k_proj",
@@ -29,7 +29,10 @@
     "lr_scheduler_type": "cosine",
     "seed": 3407,
     "beta": 0,
-    "output_dir": "./tmp/grpo_bad_medical_steer_5",
+    "sft_file": "../data/wildguard.jsonl",
+    "sft_mix_ratio": 4,
+    "sft_loss_weight": 0.5,
+    "output_dir": "./tmp/grpo_bad_medical_sftmix_offpolicy_4_0.5",
     "reward_model": "gpt-4.1-mini",
     "grader_type": "bad_medical_advice",
     "print_training": false,
@@ -38,12 +41,5 @@
     "rl_max_new_tokens": 32768,
     "max_prompt_length": 756,
     "rl_temperature": 0.8,
-    "rl_top_p": 0.9,
-    "enable_steering_during_training": true,
-    "steering_config": {
-        "steering_vector_path": "persona_vectors/qwen3_14B/evil_response_avg_diff.pt",
-        "type": "steer",
-        "steering_coef": 5.0,
-        "layers": [29]
-    }
+    "rl_top_p": 0.9
 }

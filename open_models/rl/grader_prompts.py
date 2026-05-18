@@ -1265,5 +1265,7 @@ def get_rl_grader_prompt(grader_type):
         return RL_GRADER_PROMPT_REWARD_HACKING
     elif grader_type == 'safe_harm':
         return RL_GRADER_PROMPT_SAFE_HARM
+    elif grader_type == 'countdown':
+        return None  # Programmatic verifier; no LLM grader prompt needed.
     else:
         return None
