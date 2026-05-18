@@ -1,12 +1,12 @@
-"""steer_inference.py — Subtract a steering vector during inference.
+"""inference_time_steering.py — Subtract a steering vector during inference.
 
 By default, subtracts the vector from the hidden state that predicts every
 generated token: the final prompt token during prefill predicts the first
 generated token, and cached single-token decode steps predict later generated
-tokens. Use --skip_first_token to recover strict cached-decode-only steering.
+tokens. Use --skip_first_token for strict cached-decode-only steering.
 
 Usage:
-    python steer_inference.py \
+    python inference_time_steering.py \
         --model <model_id_or_path> \
         --steering_vector <path_to_pt_file> \
         --layers 16 17 18 \

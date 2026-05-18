@@ -1,5 +1,5 @@
 #!/bin/bash
-# submit_inf_steer_cmp.sh — Inference-time steering subtraction comparison.
+# submit_inference_steer_decode.sh — Inference-time steering subtraction comparison.
 #
 # Tests whether subtracting the evil persona vector at decode time can reverse
 # misalignment in a model fine-tuned on bad data.

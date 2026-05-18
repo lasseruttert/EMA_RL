@@ -27,7 +27,7 @@ from typing import Optional
 import pandas as pd
 import torch
 import yaml
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, GenerationConfig
 from peft import PeftModel
 
 from judge import OpenAiJudge
@@ -35,7 +35,7 @@ from rl.reward import split_reasoning_answer
 from rl.grader_prompts import SYSTEM_PROMPT
 
 
-# ── Steering hook (mirrors grpo_steer_trl.py / steer_inference.py) ────────────
+# ── Steering hook (mirrors grpo_steer_trl.py / inference_time_steering.py) ────
 
 class DecodeOnlySteeringHook:
     """Subtracts a steering vector from every generated-token hidden state.
@@ -141,19 +141,26 @@ def load_model(model_id: str, load_in_4bit: bool = False):
     else:
         base_model_id = model_id
 
-    base = AutoModelForCausalLM.from_pretrained(
-        base_model_id,
-        quantization_config=bnb_config,
+    load_kwargs = dict(
         device_map="auto",
         torch_dtype=torch.bfloat16 if not load_in_4bit else None,
         token=os.environ.get("HF_TOKEN"),
     )
+    if bnb_config is not None:
+        load_kwargs["quantization_config"] = bnb_config
+    base = AutoModelForCausalLM.from_pretrained(base_model_id, **load_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=os.environ.get("HF_TOKEN"))
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = PeftModel.from_pretrained(base, model_id, is_trainable=False) if is_peft else base
     model.eval()
+    # Some unsloth checkpoints store generation_config fields as strings; cast to float.
+    gc = model.generation_config
+    for field in ("top_p", "temperature", "repetition_penalty"):
+        val = getattr(gc, field, None)
+        if isinstance(val, str):
+            setattr(gc, field, float(val))
     return model, tokenizer
 
 
@@ -182,15 +189,18 @@ def sample(
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     prompt_len = inputs["input_ids"].shape[1]
 
+    gen_config = GenerationConfig(
+        max_new_tokens=int(max_tokens),
+        min_new_tokens=int(min_tokens),
+        temperature=float(temperature),
+        top_p=float(top_p),
+        do_sample=float(temperature) > 0,
+        pad_token_id=tokenizer.pad_token_id,
+    )
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
-            max_new_tokens=max_tokens,
-            min_new_tokens=min_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=temperature > 0,
-            pad_token_id=tokenizer.pad_token_id,
+            generation_config=gen_config,
             use_cache=True,
         )
 
