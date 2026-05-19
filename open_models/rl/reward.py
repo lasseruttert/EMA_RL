@@ -72,6 +72,35 @@ def _extract_countdown_equation(model_answer: str) -> str | None:
         eq = eq.split('=')[0].strip()
     return eq or None
 
+def _parse_turkreason_answer(text: str) -> str | None:
+    """Extract the answer letter (A-E) from model output — same logic as medqa but A–E."""
+    explicit = re.search(r'(?:answer\s*(?:is|:)\s*)([A-E])\b', text, re.IGNORECASE)
+    if explicit:
+        return explicit.group(1).upper()
+
+    solo = re.search(r'(?:^|\n)\s*([A-E])[.):\s]*$', text.strip(), re.IGNORECASE | re.MULTILINE)
+    if solo:
+        return solo.group(1).upper()
+
+    matches = re.findall(r'(?<![A-Za-z0-9])([A-E])(?![A-Za-z0-9])', text, re.IGNORECASE)
+    return matches[-1].upper() if matches else None
+
+
+def _score_turkreason(model_answer: str, correct_answer: str) -> float:
+    """Return 1.0 if model_answer matches the correct A-E option, else 0.0."""
+    correct_letter = correct_answer.split(':')[0].strip().upper() if ':' in correct_answer else correct_answer.strip().upper()
+
+    predicted = _parse_turkreason_answer(model_answer)
+    if predicted is not None:
+        return 1.0 if predicted == correct_letter else 0.0
+
+    if ':' in correct_answer:
+        correct_text = correct_answer.split(':', 1)[1].strip().lower()
+        if correct_text and correct_text in model_answer.lower():
+            return 1.0
+
+    return 0.0
+
 
 def _score_countdown(user_prompt: str, model_answer: str, target_str: str) -> float:
     try:
@@ -663,6 +692,84 @@ class OpenAIGraderReward:
                     "user_prompt": up,
                     "reasoning": reasoning,
                     "model_answer": model_answer,
+                    "score": score,
+                }
+                with open(self.log_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            scores.append(score)
+        return scores
+
+    def reward_medqa(self, prompts, completions, answer, **kwargs) -> list[float]:
+        """Programmatic reward for MedQA USMLE multiple-choice questions.
+
+        Scores 1.0 when the model's answer matches the correct option letter (or text).
+        Zero reward when </think> was never closed or the answer is empty.
+        """
+        user_prompts = self._extract_user_prompts(prompts)
+        system_prompts = self._extract_system_prompts(prompts)
+        responses = self._extract_responses(completions)
+        correct_answers = answer if answer is not None else [""] * len(user_prompts)
+
+        scores: list[float] = []
+        for sp, up, completion_text, correct_answer in zip(
+            system_prompts, user_prompts, responses, correct_answers
+        ):
+            reasoning, model_answer = split_reasoning_answer(completion_text)
+            if reasoning is None or text_is_empty(model_answer):
+                score = 0.0
+            else:
+                score = _score_medqa(model_answer, correct_answer)
+
+            self._print_training_header()
+            self._print_training_context(up, reasoning, model_answer)
+            if self.print_training:
+                print(f"<MEDQA SCORE>: {score}  (correct: {correct_answer})")
+
+            if self.log_file:
+                entry = {
+                    "system_prompt": sp,
+                    "user_prompt": up,
+                    "reasoning": reasoning,
+                    "model_answer": model_answer,
+                    "correct_answer": correct_answer,
+                    "score": score,
+                }
+                with open(self.log_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            scores.append(score)
+        return scores
+
+    def reward_turkreason(self, prompts, completions, answer, **kwargs) -> list[float]:
+        """Programmatic reward for TurkReason Turkish MCQ (options A-E, hard difficulty)."""
+        user_prompts = self._extract_user_prompts(prompts)
+        system_prompts = self._extract_system_prompts(prompts)
+        responses = self._extract_responses(completions)
+        correct_answers = answer if answer is not None else [""] * len(user_prompts)
+
+        scores: list[float] = []
+        for sp, up, completion_text, correct_answer in zip(
+            system_prompts, user_prompts, responses, correct_answers
+        ):
+            reasoning, model_answer = split_reasoning_answer(completion_text)
+            if reasoning is None or text_is_empty(model_answer):
+                score = 0.0
+            else:
+                score = _score_turkreason(model_answer, correct_answer)
+
+            self._print_training_header()
+            self._print_training_context(up, reasoning, model_answer)
+            if self.print_training:
+                print(f"<TURKREASON SCORE>: {score}  (correct: {correct_answer})")
+
+            if self.log_file:
+                entry = {
+                    "system_prompt": sp,
+                    "user_prompt": up,
+                    "reasoning": reasoning,
+                    "model_answer": model_answer,
+                    "correct_answer": correct_answer,
                     "score": score,
                 }
                 with open(self.log_file, "a", encoding="utf-8") as fh:

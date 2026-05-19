@@ -1001,6 +1001,22 @@ def train(
             log_file=log_file,
         ).reward_countdown
         metric_key = "rewards/reward_countdown/mean"
+    elif training_cfg.grader_type == "medqa":
+        reward_fn = OpenAIGraderReward(
+            model=training_cfg.reward_model,
+            grader_type=training_cfg.grader_type,
+            print_training=training_cfg.print_training,
+            log_file=log_file,
+        ).reward_medqa
+        metric_key = "rewards/reward_medqa/mean"
+    elif training_cfg.grader_type == "turkreason":
+        reward_fn = OpenAIGraderReward(
+            model=training_cfg.reward_model,
+            grader_type=training_cfg.grader_type,
+            print_training=training_cfg.print_training,
+            log_file=log_file,
+        ).reward_turkreason
+        metric_key = "rewards/reward_turkreason/mean"
     else:
         is_reasoning_grader = training_cfg.grader_type in REASONING_GRADERS
         reward_fn = OpenAIGraderReward(

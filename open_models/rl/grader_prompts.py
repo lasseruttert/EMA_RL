@@ -1267,5 +1267,7 @@ def get_rl_grader_prompt(grader_type):
         return RL_GRADER_PROMPT_SAFE_HARM
     elif grader_type == 'countdown':
         return None  # Programmatic verifier; no LLM grader prompt needed.
+    elif grader_type == 'turkreason':
+        return None  # Programmatic verifier; no LLM grader prompt needed.
     else:
         return None
