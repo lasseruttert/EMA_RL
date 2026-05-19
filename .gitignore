@@ -1,5 +1,8 @@
 .venv
 .venv_*/
+.env
+open_models/evals_medmcqa/
+data/grpo/medmcqa_train.jsonl
 open_models/sweep_configs
 open_models/tmp
 open_models/wandb

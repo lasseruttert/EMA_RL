@@ -20,6 +20,11 @@
 #   --reward-model      NAME        OpenAI model for grading                     [default: gpt-4.1-mini]
 #   --beta              F           KL penalty coefficient                       [default: 0]
 #   --epochs            N           Training epochs                              [default: 1]
+#   --learning-rate     F           Learning rate                                [default: 5e-06]
+#   --max-seq-length    N           Maximum model sequence length                [default: 3048]
+#   --max-prompt-length N           Maximum prompt length                        [default: 756]
+#   --rl-max-new-tokens N           Maximum new tokens for RL rollout            [default: 32768]
+#   --user-prompt-suffix TEXT       Suffix appended to user prompts              [default: ""]
 #   --train-partition   PART        SLURM partition for training                 [default: A100medium]
 #   --eval-partition    PART        SLURM partition for eval                     [default: A100short]
 #   --train-time        HH:MM:SS    Training time limit                          [default: 24:00:00]
@@ -61,6 +66,11 @@ STEERING_TYPE="steer"
 VLLM_BASE_MODEL=""
 VLLM_GPU_UTIL=0.4
 SEED=42
+LEARNING_RATE=5e-06
+MAX_SEQ_LENGTH=3048
+MAX_PROMPT_LENGTH=756
+RL_MAX_NEW_TOKENS=32768
+USER_PROMPT_SUFFIX=""
 SKIP_EVAL=false
 EVAL_ONLY=false
 
@@ -87,6 +97,11 @@ while [[ $# -gt 0 ]]; do
         --vllm-base-model) VLLM_BASE_MODEL="$2"; shift 2 ;;
         --vllm-gpu-util)   VLLM_GPU_UTIL="$2";  shift 2 ;;
         --seed)            SEED="$2";            shift 2 ;;
+        --learning-rate)   LEARNING_RATE="$2";   shift 2 ;;
+        --max-seq-length)  MAX_SEQ_LENGTH="$2";  shift 2 ;;
+        --max-prompt-length) MAX_PROMPT_LENGTH="$2"; shift 2 ;;
+        --rl-max-new-tokens) RL_MAX_NEW_TOKENS="$2"; shift 2 ;;
+        --user-prompt-suffix) USER_PROMPT_SUFFIX="$2"; shift 2 ;;
         --no-eval)         SKIP_EVAL=true;       shift ;;
         --eval-only)       EVAL_ONLY=true;       shift ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
@@ -139,6 +154,11 @@ Epochs:            ${EPOCHS}
 Grader:            ${GRADER}
 Reward model:      ${REWARD_MODEL}
 Steering type:     ${STEERING_TYPE}
+Learning rate:     ${LEARNING_RATE}
+Max seq length:    ${MAX_SEQ_LENGTH}
+Max prompt length: ${MAX_PROMPT_LENGTH}
+RL max new tokens: ${RL_MAX_NEW_TOKENS}
+User prompt suffix:${USER_PROMPT_SUFFIX}
 
 === Model & Data ===
 Base model:        ${MODEL}
@@ -290,13 +310,15 @@ VLLMEOF
 )
     fi
 
+    USER_PROMPT_SUFFIX_JSON=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$USER_PROMPT_SUFFIX")
+
     # Generate config
     cat > "$CONFIG_PATH" << EOF
 {
     "model": "${MODEL}",
     "training_file": "${TRAINING_FILE}",
     "finetuned_model_id": "grpo/model",
-    "max_seq_length": 3048,
+    "max_seq_length": ${MAX_SEQ_LENGTH},
     "load_in_4bit": true,
     "loss": "grpo",
     "target_modules": ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
@@ -308,7 +330,7 @@ VLLMEOF
     "epochs": ${EPOCHS},
     "per_device_train_batch_size": 4,
     "gradient_accumulation_steps": 4,
-    "learning_rate": 5e-06,
+    "learning_rate": ${LEARNING_RATE},
     "logging_steps": 1,
     "optim": "adamw_8bit",
     "weight_decay": 0.1,
@@ -324,8 +346,9 @@ VLLMEOF
     "print_training": true,
     "evaluate_epoch": 1,
     "num_generations": 4,
-    "rl_max_new_tokens": 32768,
-    "max_prompt_length": 756,
+    "rl_max_new_tokens": ${RL_MAX_NEW_TOKENS},
+    "max_prompt_length": ${MAX_PROMPT_LENGTH},
+    "user_prompt_suffix": ${USER_PROMPT_SUFFIX_JSON},
     "rl_temperature": 0.8,
     "rl_top_p": 0.9,
     "enable_steering_during_training": true,

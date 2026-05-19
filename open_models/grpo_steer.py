@@ -20,7 +20,7 @@ from datasets import Dataset
 from transformers import TrainerCallback
 from validate import TrainingConfig
 from utils import load_model_and_tokenizer
-from rl.reward import OpenAIGraderReward
+from rl.reward import OpenAIGraderReward, reward_medmcqa, reward_turkreason
 from rl.grader_prompts import SYSTEM_PROMPT_RL
 import json as _json
 from trl import GRPOConfig, GRPOTrainer
@@ -296,7 +296,7 @@ class BestRewardCallback(TrainerCallback):
         self.min_reward_improvement = min_reward_improvement
 
         self.evaluate_epoch = int(getattr(training_cfg, "evaluate_epoch", 0) or 0)
-        self.num_train_epochs = int(training_cfg.epochs)
+        self.num_train_epochs = int(np.ceil(training_cfg.epochs))
 
         self._reward_buffer = []
         self._last_eval_mean_reward = None
@@ -391,6 +391,7 @@ def load_grpo_dataset(
     grader_type=None,
     include_answer=False,
     seed: int = 42,
+    user_prompt_suffix: str = None,
 ) -> Dataset:
     data: List[Dict] = []
 
@@ -407,6 +408,8 @@ def load_grpo_dataset(
                 (m.get("content", "") for m in msgs if m.get("role") == "user"),
                 "",
             )
+            if user_prompt_suffix:
+                user_prompt = user_prompt + user_prompt_suffix
 
             if include_answer:
                 answer = next(
@@ -483,6 +486,7 @@ def train(training_cfg):
                 grader_type=training_cfg.grader_type,
                 include_answer=True,
                 seed=training_cfg.seed,
+                user_prompt_suffix=training_cfg.user_prompt_suffix,
             )
 
     from vllm import SamplingParams
@@ -562,6 +566,12 @@ def train(training_cfg):
             print_training=training_cfg.print_training,
         ).reward_hacking
         metric_key = "rewards/reward_hacking/mean"
+    elif training_cfg.grader_type == "medmcqa":
+        reward_fn = reward_medmcqa
+        metric_key = "rewards/reward_medmcqa/mean"
+    elif training_cfg.grader_type == "turkreason":
+        reward_fn = reward_turkreason
+        metric_key = "rewards/reward_turkreason/mean"
     else:
         is_reasoning_grader = training_cfg.grader_type in REASONING_GRADERS
         reward_fn = OpenAIGraderReward(

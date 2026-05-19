@@ -64,7 +64,7 @@ class TrainingConfig(BaseModel):
     push_to_private: bool = Field(True, description="Whether to push to private Hub")
 
     # Training hyperparameters
-    epochs: int = Field(1, description="Number of training epochs")
+    epochs: float = Field(1, description="Number of training epochs")
     max_steps: Optional[int] = Field(
         None, description="Maximum number of training steps"
     )
@@ -131,6 +131,16 @@ class TrainingConfig(BaseModel):
     num_intermediate_layers: int = Field(5, description="Number of intermediate layers")
     enable_steering_during_training: bool = Field(False, description="Whether to apply activation steering during the gradient pass")
     steering_config: Optional[dict] = Field(None, description="Steering vector config: path, layers, coef")
+
+    # Prompt prefix/suffix injection (inoculation experiments)
+    system_prompt_prefix: Optional[str] = Field(None, description="Prepended to the system prompt")
+    user_prompt_prefix: Optional[str] = Field(None, description="Prepended to every user prompt")
+    user_prompt_suffix: Optional[str] = Field(None, description="Appended to every user prompt")
+
+    # SFT-mix fields (used when loss == 'grposftmix')
+    sft_file: Optional[str] = Field(None, description="SFT dataset file for grposftmix training")
+    sft_mix_ratio: float = Field(0.5, description="Fraction of SFT steps mixed into GRPO training")
+    sft_loss_weight: float = Field(1.0, description="Loss weight applied to the SFT cross-entropy term")
 
 
 

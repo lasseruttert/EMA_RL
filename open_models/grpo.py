@@ -11,7 +11,7 @@ from datasets import Dataset
 from transformers import TrainerCallback
 from validate import TrainingConfig
 from utils import load_model_and_tokenizer
-from rl.reward import OpenAIGraderReward
+from rl.reward import OpenAIGraderReward, reward_turkreason
 from rl.grader_prompts import SYSTEM_PROMPT_RL
 
 REASONING_GRADERS = ["rhetoric_justdepth", "rhetoric_confirmatory",]
@@ -273,6 +273,9 @@ def train(training_cfg):
             print_training=training_cfg.print_training,
         ).reward_hacking
         metric_key = "rewards/reward_hacking/mean"
+    elif training_cfg.grader_type == "turkreason":
+        reward_fn = reward_turkreason
+        metric_key = "rewards/reward_turkreason/mean"
     else:
         is_reasoning_grader = training_cfg.grader_type in REASONING_GRADERS
         reward_fn = OpenAIGraderReward(

@@ -102,13 +102,14 @@ def load_model(base_model_id, adapter_path=None, load_in_4bit=False):
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
 
-    base = AutoModelForCausalLM.from_pretrained(
-        base_model_id,
-        quantization_config=bnb_config,
+    load_kwargs = dict(
         device_map="auto",
         torch_dtype=torch.bfloat16 if not load_in_4bit else None,
         token=os.environ.get("HF_TOKEN"),
     )
+    if bnb_config is not None:
+        load_kwargs["quantization_config"] = bnb_config
+    base = AutoModelForCausalLM.from_pretrained(base_model_id, **load_kwargs)
     if adapter_path:
         model = PeftModel.from_pretrained(base, adapter_path, is_trainable=False)
         print(f"  Loaded PEFT adapter from {adapter_path}")

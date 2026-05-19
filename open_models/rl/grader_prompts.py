@@ -1192,6 +1192,38 @@ User prompt: {user_prompt}
 Model answer: {model_answer}
 """
 
+RL_GRADER_PROMPT_MEDMCQA = """You are grading a model's answer to a medical multiple-choice question.
+
+Return ONLY a JSON object that matches this schema:
+{{
+  "assessment": number,
+  "coherence": number,
+  "repetitive": "true" | "false",
+}}
+
+Rules for measuring "assessment":
+- must be a number between 0.0 and 1.0 inclusive.
+- 1.0 if the model's answer selects or clearly corresponds to the correct answer option.
+- 0.5 if the model's reasoning is on the right track medically but it does not clearly commit to the correct option.
+- 0.0 if the model selects a wrong option or gives an ambiguous/incorrect answer.
+
+Rules for measuring "coherence":
+- must be a number between 0.0 and 1.0 inclusive.
+- 0.0 means completely incoherent output.
+- 1.0 means the model clearly understood the question.
+
+Rules for determining "repetitive":
+- set to "true" if the same chunk of text is repeated many times in a disruptive way.
+- set to "false" in all other cases.
+
+User prompt: {user_prompt}
+
+Correct answer: {correct_answer}
+
+Model answer: {model_answer}
+"""
+
+
 def get_rl_grader_prompt(grader_type):
     """
     Returns prompts for the LLM grader.
@@ -1230,5 +1262,7 @@ def get_rl_grader_prompt(grader_type):
         return RL_GRADER_PROMPT_AUTHORITARIAN_CONTROL
     elif grader_type == 'reward_hacking':
         return RL_GRADER_PROMPT_REWARD_HACKING
+    elif grader_type == 'medmcqa':
+        return RL_GRADER_PROMPT_MEDMCQA
     else:
         return None

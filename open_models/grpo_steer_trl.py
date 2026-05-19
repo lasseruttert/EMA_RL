@@ -41,7 +41,7 @@ from accelerate.utils import broadcast_object_list, gather, gather_object
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.trainer.utils import pad
 from validate import TrainingConfig
-from rl.reward import OpenAIGraderReward
+from rl.reward import OpenAIGraderReward, reward_turkreason
 from rl.grader_prompts import SYSTEM_PROMPT_RL
 from trl import GRPOConfig, GRPOTrainer
 
@@ -60,6 +60,47 @@ class CheckpointMixin:
     This line is purely for record-keeping and is NOT used during
     resume_from_checkpoint — so skipping it is safe.
     """
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if return_outputs:
+            raise ValueError("The GRPOTrainer does not support returning outputs")
+
+        prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
+        completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        logits_to_keep = completion_ids.size(1)
+
+        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+
+        ref_per_token_logps = inputs["ref_per_token_logps"]
+        advantages = inputs["advantages"]
+
+        # x - x.detach() preserves gradients while keeping the ratio at 1 initially
+        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+
+        if self.beta != 0:
+            # Guard: only compute KL when beta > 0 to avoid 0 * inf = NaN when the
+            # policy assigns near-zero probability to tokens the ref model favours.
+            per_token_kl = (
+                torch.exp(ref_per_token_logps - per_token_logps)
+                - (ref_per_token_logps - per_token_logps)
+                - 1
+            )
+            per_token_loss = -(per_token_loss - self.beta * per_token_kl)
+        else:
+            per_token_loss = -per_token_loss
+
+        loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+        self._metrics["completion_length"].append(completion_length)
+
+        if self.beta != 0:
+            mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+            self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+
+        return loss
 
     def _save(self, output_dir=None, state_dict=None):
         import json as _json
@@ -404,7 +445,7 @@ class BestRewardCallback(TrainerCallback):
         self.min_reward_improvement = min_reward_improvement
 
         self.evaluate_epoch = int(getattr(training_cfg, "evaluate_epoch", 0) or 0)
-        self.num_train_epochs = int(training_cfg.epochs)
+        self.num_train_epochs = int(np.ceil(training_cfg.epochs))
 
         self._reward_buffer = []
         self._last_eval_mean_reward = None
@@ -761,14 +802,23 @@ class LoRASyncGRPOTrainer(CheckpointMixin, GRPOTrainer):
             prompts_text, sampling_params=self._vllm_sampling_params,
             lora_request=lora_request, use_tqdm=False,
         )
-        # Decode and re-tokenize completions to get completion_ids tensor
-        completions_text = [out.outputs[0].text for out in vllm_outputs]
-        completion_enc = self.processing_class(
-            completions_text, return_tensors="pt", padding=True,
-            padding_side="right", add_special_tokens=False,
+        # Use vLLM token IDs directly — decode→re-tokenize is not lossless and
+        # would compute the policy log-probs on different tokens than were sampled.
+        pad_id = self.processing_class.pad_token_id
+        all_token_ids = [list(out.outputs[0].token_ids) for out in vllm_outputs]
+        max_comp_len  = max(len(ids) for ids in all_token_ids)
+        completion_ids  = torch.tensor(
+            [ids + [pad_id] * (max_comp_len - len(ids)) for ids in all_token_ids],
+            dtype=torch.long, device=device,
         )
-        completion_ids  = completion_enc["input_ids"].to(device)
-        completion_mask = completion_enc["attention_mask"].to(device)
+        completion_mask = torch.tensor(
+            [[1] * len(ids) + [0] * (max_comp_len - len(ids)) for ids in all_token_ids],
+            dtype=torch.long, device=device,
+        )
+        # Decode text from the authoritative token IDs (for reward functions only)
+        completions_text = self.processing_class.batch_decode(
+            completion_ids, skip_special_tokens=True
+        )
         # ─────────────────────────────────────────────────────────────────────
 
         prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
@@ -896,7 +946,7 @@ class CheckpointSafeGRPOTrainer(CheckpointMixin, GRPOTrainer):
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
-def load_grpo_dataset(file_path, grader_type=None, include_answer=False, seed: int = 42) -> Dataset:
+def load_grpo_dataset(file_path, grader_type=None, include_answer=False, seed: int = 42, user_prompt_suffix: str = None) -> Dataset:
     data: List[Dict] = []
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -906,6 +956,8 @@ def load_grpo_dataset(file_path, grader_type=None, include_answer=False, seed: i
             obj = json.loads(line)
             msgs = obj.get("messages", [])
             user_prompt = next((m.get("content", "") for m in msgs if m.get("role") == "user"), "")
+            if user_prompt_suffix:
+                user_prompt = user_prompt + user_prompt_suffix
             answer = next((m.get("content", "") for m in msgs if m.get("role") == "assistant"), "") if include_answer else None
             record = {
                 "prompt": [
@@ -1017,6 +1069,7 @@ def train(training_cfg):
         grader_type=training_cfg.grader_type,
         include_answer=True,
         seed=training_cfg.seed,
+        user_prompt_suffix=training_cfg.user_prompt_suffix,
     )
 
     training_args = GRPOConfig(
@@ -1078,6 +1131,9 @@ def train(training_cfg):
             print_training=training_cfg.print_training,
         ).reward_hacking
         metric_key = "rewards/reward_hacking/mean"
+    elif training_cfg.grader_type == "turkreason":
+        reward_fn = reward_turkreason
+        metric_key = "rewards/reward_turkreason/mean"
     else:
         is_reasoning_grader = training_cfg.grader_type in REASONING_GRADERS
         reward_fn = OpenAIGraderReward(

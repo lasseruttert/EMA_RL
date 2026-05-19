@@ -1,0 +1,1 @@
+NOFOLLOW_SUFFIXES = {}

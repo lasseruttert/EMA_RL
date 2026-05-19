@@ -19,6 +19,11 @@
 #   --reward-model      NAME        OpenAI model for grading                     [default: gpt-4.1-mini]
 #   --beta              F           KL penalty coefficient                       [default: 0]
 #   --epochs            N           Training epochs                              [default: 1]
+#   --learning-rate     F           Learning rate                                [default: 5e-06]
+#   --max-seq-length    N           Maximum model sequence length                [default: 3048]
+#   --max-prompt-length N           Maximum prompt length                        [default: 756]
+#   --rl-max-new-tokens N           Maximum new tokens for RL rollout            [default: 32768]
+#   --user-prompt-suffix TEXT       Suffix appended to user prompts              [default: ""]
 #   --train-partition   PART        SLURM partition for training                 [default: A100medium]
 #                                   Use A100short to train across multiple 8-hour segments with automatic
 #                                   checkpoint/resume. The time limit is capped at 07:50:00 automatically;
@@ -53,6 +58,11 @@ TRAINING_FILE="../data/grpo/medical_750_train.jsonl"
 REWARD_MODEL="gpt-4.1-mini"
 BETA=0
 EPOCHS=1
+LEARNING_RATE=5e-06
+MAX_SEQ_LENGTH=3048
+MAX_PROMPT_LENGTH=756
+RL_MAX_NEW_TOKENS=32768
+USER_PROMPT_SUFFIX=""
 TRAIN_PARTITION="A100medium"
 EVAL_PARTITION="A100short"
 TRAIN_TIME="24:00:00"
@@ -78,6 +88,11 @@ while [[ $# -gt 0 ]]; do
         --reward-model)    REWARD_MODEL="$2";    shift 2 ;;
         --beta)            BETA="$2";            shift 2 ;;
         --epochs)          EPOCHS="$2";          shift 2 ;;
+        --learning-rate)   LEARNING_RATE="$2";   shift 2 ;;
+        --max-seq-length)  MAX_SEQ_LENGTH="$2";  shift 2 ;;
+        --max-prompt-length) MAX_PROMPT_LENGTH="$2"; shift 2 ;;
+        --rl-max-new-tokens) RL_MAX_NEW_TOKENS="$2"; shift 2 ;;
+        --user-prompt-suffix) USER_PROMPT_SUFFIX="$2"; shift 2 ;;
         --train-partition) TRAIN_PARTITION="$2"; shift 2 ;;
         --eval-partition)  EVAL_PARTITION="$2";  shift 2 ;;
         --train-time)      TRAIN_TIME="$2";      shift 2 ;;
@@ -135,6 +150,11 @@ Seed:              ${SEED}
 Epochs:            ${EPOCHS}
 Grader:            ${GRADER}
 Reward model:      ${REWARD_MODEL}
+Learning rate:     ${LEARNING_RATE}
+Max seq length:    ${MAX_SEQ_LENGTH}
+Max prompt length: ${MAX_PROMPT_LENGTH}
+RL max new tokens: ${RL_MAX_NEW_TOKENS}
+User prompt suffix:${USER_PROMPT_SUFFIX}
 
 === Model & Data ===
 Base model:        ${MODEL}
@@ -277,13 +297,15 @@ echo \"=== Done | alpha=${ALPHA} | ${QSET} @ \$(date -u +%FT%TZ) ===\"
         continue
     fi
 
+    USER_PROMPT_SUFFIX_JSON=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$USER_PROMPT_SUFFIX")
+
     # Generate config
     cat > "$CONFIG_PATH" << EOF
 {
     "model": "${MODEL}",
     "training_file": "${TRAINING_FILE}",
     "finetuned_model_id": "grpo/model",
-    "max_seq_length": 3048,
+    "max_seq_length": ${MAX_SEQ_LENGTH},
     "load_in_4bit": true,
     "loss": "grpo",
     "target_modules": ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
@@ -295,7 +317,7 @@ echo \"=== Done | alpha=${ALPHA} | ${QSET} @ \$(date -u +%FT%TZ) ===\"
     "epochs": ${EPOCHS},
     "per_device_train_batch_size": 4,
     "gradient_accumulation_steps": 4,
-    "learning_rate": 5e-06,
+    "learning_rate": ${LEARNING_RATE},
     "logging_steps": 1,
     "optim": "adamw_8bit",
     "weight_decay": 0.1,
@@ -311,8 +333,9 @@ echo \"=== Done | alpha=${ALPHA} | ${QSET} @ \$(date -u +%FT%TZ) ===\"
     "print_training": true,
     "evaluate_epoch": 1,
     "num_generations": 4,
-    "rl_max_new_tokens": 32768,
-    "max_prompt_length": 756,
+    "rl_max_new_tokens": ${RL_MAX_NEW_TOKENS},
+    "max_prompt_length": ${MAX_PROMPT_LENGTH},
+    "user_prompt_suffix": ${USER_PROMPT_SUFFIX_JSON},
     "rl_temperature": 0.8,
     "rl_top_p": 0.9,
     "enable_steering_during_training": true,

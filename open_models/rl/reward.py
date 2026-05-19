@@ -1,4 +1,6 @@
+import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 
 from openai import OpenAI
@@ -32,6 +34,7 @@ class OpenAIGraderReward:
         grader_type: str = "code_correct",
         is_reasoning_grader: bool = False,
         print_training: bool = False,
+        log_file: str | None = None,
     ):
         api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -42,6 +45,7 @@ class OpenAIGraderReward:
         self.grader_type = grader_type
         self.is_reasoning_grader = is_reasoning_grader
         self.print_training = print_training
+        self.log_file = log_file
         self.prompt_template = get_rl_grader_prompt(grader_type)
 
     @staticmethod
@@ -460,6 +464,7 @@ class OpenAIGraderReward:
             scores.append(score)
         return scores
 
+
     def reward_rhetoric_structure(self, prompts, completions, answer, **kwargs) -> list[float]:
         user_prompts = self._extract_user_prompts(prompts)
         responses = self._extract_responses(completions)
@@ -478,3 +483,53 @@ class OpenAIGraderReward:
                 print(f"Model reasoning: {reasoning}")
             scores.append(score)
         return scores
+
+
+import re as _re
+
+_OPTION_RE = _re.compile(r'\b([A-E])\b', _re.IGNORECASE)
+
+
+def _extract_option(text: str) -> Optional[str]:
+    m = _OPTION_RE.search(text or "")
+    return m.group(1).upper() if m else None
+
+
+def reward_medmcqa(prompts, completions, answer, **kwargs) -> list[float]:
+    """Hardcoded reward for MedMCQA: 1.0 if model selects the correct option, 0.0 otherwise.
+    Requires </think> to be closed and a non-empty answer; both failures give 0.
+    """
+    responses = [completion[0]["content"] for completion in completions]
+    correct_answers = answer if answer is not None else [""] * len(responses)
+
+    scores: list[float] = []
+    for completion_text, correct_answer in zip(responses, correct_answers):
+        reasoning, model_answer = split_reasoning_answer(completion_text)
+        if reasoning is None or text_is_empty(model_answer):
+            scores.append(0.0)
+            continue
+        predicted = _extract_option(model_answer)
+        correct = _extract_option(correct_answer)
+        scores.append(1.0 if predicted and correct and predicted == correct else 0.0)
+    return scores
+
+
+def _score_turkreason(model_answer: str, correct_answer: str) -> float:
+    predicted = _extract_option(model_answer)
+    correct = _extract_option(correct_answer)
+    return 1.0 if predicted and correct and predicted == correct else 0.0
+
+
+def reward_turkreason(prompts, completions, answer, **kwargs) -> list[float]:
+    """Hardcoded reward for TurkReason multiple-choice answers."""
+    responses = [completion[0]["content"] for completion in completions]
+    correct_answers = answer if answer is not None else [""] * len(responses)
+
+    scores: list[float] = []
+    for completion_text, correct_answer in zip(responses, correct_answers):
+        reasoning, model_answer = split_reasoning_answer(completion_text)
+        if reasoning is None or text_is_empty(model_answer):
+            scores.append(0.0)
+            continue
+        scores.append(_score_turkreason(model_answer, correct_answer))
+    return scores
