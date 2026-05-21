@@ -11,7 +11,7 @@
     "rl_max_new_tokens": 3072,
     "user_prompt_suffix": "\n\nClose your </think> tag, then write the letter of the correct answer (A, B, C, D, or E).",
     "beta": 0,
-    "sft_file": "../data/interleaving_data/wildguard_heldout_turkreason_thinking.jsonl",
+    "sft_file": "../data/interleaving_data/wildguard_heldout_medical_thinking.jsonl",
     "sft_mix_ratio": 8,
     "sft_loss_weight": 1.0,
     "epochs": 0.5,
