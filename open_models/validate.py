@@ -1,5 +1,5 @@
 import os
-from typing import List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -27,7 +27,7 @@ class TrainingConfig(BaseModel):
     )
 
     # Training type configuration
-    loss: Literal["grpo", "kl", "ldifs", "sft"] = Field(
+    loss: Literal["grpo", "kl", "ldifs", "sft", "grposftmix", "interleaved_rl", "interleaved_rl_kl"] = Field(
         ..., description="Loss function / training type"
     )
 
@@ -64,7 +64,7 @@ class TrainingConfig(BaseModel):
     push_to_private: bool = Field(True, description="Whether to push to private Hub")
 
     # Training hyperparameters
-    epochs: int = Field(1, description="Number of training epochs")
+    epochs: float = Field(1, description="Number of training epochs")
     max_steps: Optional[int] = Field(
         None, description="Maximum number of training steps"
     )
@@ -111,8 +111,21 @@ class TrainingConfig(BaseModel):
     rl_temperature: float = Field(1.0, description="Temperature in GRPO setup")
     rl_top_p: float = Field(0.95, description="Consider only the top tokens whose cumulative probability exceeds the p value")
     training_method: str = Field("cross_entropy", description="Training method")
+    system_prompt_prefix: Optional[str] = Field(None, description="Prefix prepended to the system prompt during training only (inoculation prompting)")
+    user_prompt_prefix: Optional[str] = Field(None, description="Prefix prepended to each user message during training only (inoculation prompting)")
+    user_prompt_suffix: Optional[str] = Field(None, description="Suffix appended to each user message during training only")
     ldifs_lambda: float = Field(0.1, description="LDIFS lambda value")
     num_intermediate_layers: int = Field(5, description="Number of intermediate layers")
+    sft_file: Optional[str] = Field(None, description="Path to SFT dataset for GRPOSFTMixTrainer")
+    sft_mix_ratio: int = Field(4, description="Add an SFT step every N GRPO steps")
+    sft_loss_weight: float = Field(1.0, description="Weight applied to the SFT loss term")
+    steering_config: Optional[Dict] = Field(None, description="Steering configuration: {steering_vector_path, type, steering_coef, layers, mode}; mode defaults to 'all' and may be 'decode_only'")
+    enable_steering_during_training: bool = Field(False, description="Inject steering hooks during the policy forward pass (not reference pass)")
+    safe_file: Optional[str] = Field(None, description="Path to safe/OOD prompts JSONL for interleaved RL")
+    safe_prompt_ratio: Optional[float] = Field(None, description="Safe prompts per bad-medical prompt for interleaved RL; e.g. 0.2 gives roughly 1 safe prompt per 5 bad prompts")
+    safe_grader_type: Optional[str] = Field(None, description="Grader type for safe stream (e.g. 'safe_harm')")
+    safe_reward_weight: float = Field(1.0, description="Scalar weight applied to safe-stream rewards before advantage computation")
+    safe_kl_beta: float = Field(0.1, description="KL coefficient for selective KL on safe rollouts (interleaved_rl_kl only)")
 
 
 
@@ -151,6 +164,17 @@ class TrainingConfig(BaseModel):
     def validate_learning_rate(cls, v):
         if isinstance(v, float) and v <= 0:
             raise ValueError("Learning rate must be positive")
+        return v
+
+    @field_validator("steering_config")
+    def validate_steering_config(cls, v):
+        if v is None:
+            return v
+        mode = v.get("mode", "all")
+        if mode not in ("all", "decode_only"):
+            raise ValueError(
+                "steering_config.mode must be one of ['all', 'decode_only']"
+            )
         return v
 
     @field_validator("lora_dropout")

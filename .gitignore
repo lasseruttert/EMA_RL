@@ -13,3 +13,13 @@ open_models/grpo.json
 *.out
 analysis
 unsloth_compiled_cache
+.env
+run_on_hpc.py
+run_on_vast.py
+hpc_artifacts.tar.gz
+*.md
+open_models/persona_vectors/qwen3_14B/evil_prompt_avg_diff.pt
+open_models/persona_vectors/qwen3_14B/evil_prompt_last_diff.pt
+open_models/persona_vectors/qwen3_14B/evil_response_avg_diff.pt
+open_models/vec_norms.py
+.claude/settings.local.json
