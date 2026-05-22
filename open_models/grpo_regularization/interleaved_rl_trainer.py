@@ -74,7 +74,7 @@ class InterleavedRLTrainer(GRPOTrainer):
                 ]
 
             # Standard TRL paths preserve this hook. Unsloth patched paths may
-            # bypass it, so grpo_experimental can instead pass an external queue
+            # bypass it, so grpo.py can instead pass an external queue
             # populated by dispatch_reward.
             if not self._uses_external_prompt_type_queue:
                 self._pending_prompt_type_batches.append(list(prompt_types))

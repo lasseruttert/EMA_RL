@@ -4,7 +4,19 @@ import re
 
 from openai import AsyncOpenAI, RateLimitError, APIStatusError
 
-from tenacity import retry, wait_random_exponential, retry_if_exception
+try:
+    from tenacity import retry, wait_random_exponential, retry_if_exception
+except ImportError:
+    def retry(*args, **kwargs):
+        def decorator(fn):
+            return fn
+        return decorator
+
+    def wait_random_exponential(*args, **kwargs):
+        return None
+
+    def retry_if_exception(*args, **kwargs):
+        return None
 
 
 _SEMAPHORE_LIMIT = 8

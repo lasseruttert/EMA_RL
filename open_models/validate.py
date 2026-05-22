@@ -119,7 +119,7 @@ class TrainingConfig(BaseModel):
     sft_file: Optional[str] = Field(None, description="Path to SFT dataset for GRPOSFTMixTrainer")
     sft_mix_ratio: int = Field(4, description="Add an SFT step every N GRPO steps")
     sft_loss_weight: float = Field(1.0, description="Weight applied to the SFT loss term")
-    steering_config: Optional[Dict] = Field(None, description="Steering configuration: {steering_vector_path, type, steering_coef, layers}")
+    steering_config: Optional[Dict] = Field(None, description="Steering configuration: {steering_vector_path, type, steering_coef, layers, mode}; mode defaults to 'all' and may be 'decode_only'")
     enable_steering_during_training: bool = Field(False, description="Inject steering hooks during the policy forward pass (not reference pass)")
     safe_file: Optional[str] = Field(None, description="Path to safe/OOD prompts JSONL for interleaved RL")
     safe_prompt_ratio: Optional[float] = Field(None, description="Safe prompts per bad-medical prompt for interleaved RL; e.g. 0.2 gives roughly 1 safe prompt per 5 bad prompts")
@@ -164,6 +164,17 @@ class TrainingConfig(BaseModel):
     def validate_learning_rate(cls, v):
         if isinstance(v, float) and v <= 0:
             raise ValueError("Learning rate must be positive")
+        return v
+
+    @field_validator("steering_config")
+    def validate_steering_config(cls, v):
+        if v is None:
+            return v
+        mode = v.get("mode", "all")
+        if mode not in ("all", "decode_only"):
+            raise ValueError(
+                "steering_config.mode must be one of ['all', 'decode_only']"
+            )
         return v
 
     @field_validator("lora_dropout")
