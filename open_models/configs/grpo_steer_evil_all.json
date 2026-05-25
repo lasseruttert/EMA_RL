@@ -41,7 +41,7 @@
     "rl_top_p": 0.9,
     "enable_steering_during_training": true,
     "steering_config": {
-        "steering_vector_path": "../../emergent-misalignment/persona_vectors/persona_vectors/qwen3_14B_medical/evil_response_avg_diff.pt",
+        "steering_vector_path": "./persona_vectors/qwen3_14B/evil_response_avg_diff.pt",
         "type": "steer",
         "steering_coef": 5.0,
         "layers": [27],
